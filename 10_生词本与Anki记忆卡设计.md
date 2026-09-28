@@ -1,0 +1,1104 @@
+# 10 · 生词本 + Anki 记忆卡设计（含音频选型与边听边存交互）
+
+> 归属：**附属层**（`EPIC-04`）｜优先级基准：[08_核心精听优先_产品优先级定调.md](08_%E6%A0%B8%E5%BF%83%E7%B2%BE%E5%90%AC%E4%BC%98%E5%85%88_%E4%BA%A7%E5%93%81%E4%BC%98%E5%85%88%E7%BA%A7%E5%AE%9A%E8%B0%83.md)
+> 来源：2026-09-23 镜像站 GPT（Extended）第二轮评审 + 本地音频质检
+> 状态：**设计定稿，未落代码**
+
+---
+
+## 一、先说结论（四条最高优先级）
+
+| 问题 | 判断 |
+|:--|:--|
+| **A. 以什么为单位发现生词？** | **句子＝发现单位；整篇＝聚合单位；AI 对话＝诊断单位**。三者并存但**不同权**，不能把「AI 扫全文猜 50 个可能不会的词」当成发现机制 |
+| **B. 点词后要不要立刻显示释义？** | **默认绝对不显示。点一下只「存」，不「查」。** 释义必须由用户的**第二个主动动作**打开 |
+| **D. AI 怎么判断会不会？** | **一道翻译题不能判定**。每词先 2 题、冲突才第 3 题；**必须包含一次开放产出**；只靠选择题答对，最高只能判「半会」 |
+| **E. AI 怎么选学习组件？** | **不让 AI 自由编 UI**。AI 只输出诊断标签与原因码，App 用确定规则从**固定白名单**里选，且**一次最多 2 个组件** |
+
+> 这四条决定了生词系统不会退化成「边听边查词 + AI 到处弹窗 + 一键生卡」的第二条主线。
+
+---
+
+## 二、生词本的「单位」分层
+
+```
+一级：句子  = 生词发现单位
+       只有句子能同时回答：这个词在哪段原声里？用户刚才听错了什么？
+       该回去播哪一段？做 Cloze 时上下文是什么？
+二级：整篇  = 候选汇总与计划单位
+       课程结束只说「本课候选 8 个，其中 3 个有听写证据」，不让 AI 扫全文替用户猜
+三级：AI 对话 = 掌握诊断单位
+       回答「你是认识这个词，还是会在新语境里用」，不负责最初发现
+```
+
+**用户序列（关键差异）**
+
+```
+✅ 听 → 点词/听写犯错 → 候选池 → 课程结束统一整理 → 必要时 AI 诊断 → 确认进入 SRS
+❌ 听 → 点词 → 立刻翻译 → 立刻制卡 → 立刻复习
+```
+
+**词条状态与诊断维度必须分开**：状态＝`候选 / 学习中 / 已掌握 / 忽略`；诊断维度＝`听辨弱 / 语义弱 / 使用弱 / 形态弱`。**不要把一切压成一个「不会」。**
+
+---
+
+## 三、数据模型：必须新增 VocabularyItem，不要复用 AnkiCard
+
+**依据（已核实代码）**：`AnkiCard` 本质是**句子卡**（含 `lessonId / sentenceIndex / sentenceText / startMs / endMs` + 一个 `clozeWord`），而 `createAnkiCardFromSentence()` 的判重是：
+
+```dart
+final existingIndex = _ankiCards.indexWhere(
+  (c) => c.lessonId == lesson.id && c.sentenceIndex == sentence.index,
+);
+```
+
+→ **同一句目前只能存在一张卡；一句里若有第二个生词，会把第一张覆盖掉。** 且新建卡 `dueDate: DateTime.now()` —— 「随手收藏」立即变成「今天欠你一张复习卡」。
+
+建议两层模型：
+
+| `VocabularyItem`（词本体） | `VocabularyOccurrence`（一次上下文证据） |
+|:--|:--|
+| id / surfaceForm / normalizedTerm | lessonId / lessonTitle |
+| kind: word / phrase | sentenceId / sentenceIndex / sentenceText |
+| status: candidate/learning/known/ignored | startMs / endMs / audioPath |
+| englishDefinition? / chineseGloss? | tokenStart / tokenEnd（字符 span） |
+| aiUsageNote? | source: tap / dictation / ai |
+| createdAt / lastSeenAt / seenCount | dictationDiffType? / expected? / actual? |
+| ankiCardIds | uncertain / causeHints |
+
+* V1 **不要把 AI 生成的 lemma/sense 当主键** —— 否则离线判重不稳定。
+* 音变只能存成 `causeHints` / `phoneticHints`，因为 09 已确认它们**只是文本规则推测，不是声学事实**。
+
+### 必须有「候选池 → 正式复习队列」两层
+
+进入正式 SRS 的三个条件（任一）：用户明确点「开始学习」／听写提供了可靠词级错误证据且用户确认／AI 诊断为「半会/不会」且用户接受计划。
+**AI 不得因为「这个词看起来高级」自动塞进 SRS。**
+这解决的是：**收藏成本接近零，但复习债务不能接近无限。**
+
+---
+
+## 四、边听边存的交互设计（定稿规格）
+
+### 4.1 形态：**模式**，不是全局手势
+
+| 项 | 规格 |
+|:--|:--|
+| 入口 | 精听页二级菜单 → **生词积累**（不占一级主操作位） |
+| 进入后 | 顶部一条**轻状态条**：`生词积累中 · 点词保存 · ×`；**字幕不暂停、不换页** |
+| 单击词 | 保存为候选；**再点同一词＝取消** |
+| 长按 | **不做主入口**（手机播放中长按精度差，且与系统文本选择语义冲突）；保留给**多词短语**：长按后左右拖动选中连续 2–5 词 |
+| 反馈 | 被点词获得**极轻标记**；底部 **1.5 秒 Toast**：`✓ 已存 take　撤销` |
+| **释义** | **不显示。**没有弹窗、音频不停。要查只能在**词条里第二次主动点击「查看」** |
+| 允许点词的时机 | ① 普通精听（字幕可见）② 听写 `reviewing` 批改后。**听写 `entering` 阶段禁止**（字幕被锁，点词＝泄露答案） |
+
+### 4.2 为什么故意不照抄 LingQ / Readlang
+
+LingQ、Readlang 的「点词 → 看释义 + 保存」是**阅读理解**场景的成熟做法；ListenLoop 的 08 把「听」放在所有附属能力之前，所以**只借「点词保存」，不借「点词立即解释」**。点词弹释义会让用户注意力从声音时间轴转到阅读义项选择——那等于把主任务切走。
+
+### 4.3 点词命中精度：**不要复用 `DictationEngine.tokenize()`**
+
+它是为**比对**设计的：小写化、`I'm → i am` 展开、去标点——**已经丢掉原始字符布局**，无法回答"用户点到了屏幕上哪一段字符"。需新增保留 offset 的 `SubtitleToken`：
+
+| 字段 | 说明 |
+|:--|:--|
+| surface / normalized | 原样与归一化 |
+| charStart / charEnd / tokenIndex | 命中映射 |
+
+| 输入 | 点击单位 |
+|:--|:--|
+| `don't` / `I'm` | 整个缩写算**一个**可点击 surface token，内部 normalized 再展开 |
+| `mother-in-law` | 默认整个连字符词为一个单元 |
+| `teacher's` | 整体保存，后续 normalization 再分析 possessive |
+| `, . ? !` | **不可点击** |
+
+多词短语 V1 不做「AI 在热路径猜短语」——只靠「单击＝一词 / 长按拖动＝短语」两个机制，完全离线。以后可加本地 phrase lexicon，但只能给**建议**（`可能是短语：take off`），**不得偷偷把用户点的 `off` 改成整个短语**。
+
+---
+
+## 五、AI 判定「用户不会这个词」
+
+**先改一个基本假设：听写错词 ≠ 不认识这个词。** 漏 `the` 可能是弱读没听清；`walked → walk` 可能是词尾没听见；拼错可能只是不熟拼写。09 已把错误分成 `missing / replaced / spelling / morphology / merged / split`，正说明不能把 `errorCount > 0` 全部翻译成「不会」。
+
+### 5.1 触发时机
+**不在听的过程中。** 课程结束或用户主动打开：`本课生词 → 检查我是不是真的会`，**每次最多 5 个候选**。
+优先级：**听写可靠错误 > 手动点存 > AI 认为值得检查**（AI 只能决定第三类问不问，不能凭感觉宣判）。
+
+### 5.2 每词 2 题起步，冲突才第 3 题
+
+| 题 | 内容 | 测什么 |
+|:--|:--|:--|
+| **第 1 题 · 原语境理解** | 来自原句，可先播原片 snippet。**不问**「take off 中文是什么」，而问 `In this sentence, what does "take off" mean or do?`（允许中英自由答） | 当前义项识别 |
+| **第 2 题 · 新语境产出** | AI 按同一义项换场景，要求**开放输入**，如 `Say in English that the plane leaves the ground at 7:30, using "take off".` | 能否真正取回 + 用法/形态/搭配 |
+| **第 3 题 · 仅冲突时** | 如第 1 题对、造句错 → 出对比/纠错任务 | 消解冲突 |
+
+### 5.3 「会 / 半会 / 不会」的本地映射（不让 LLM 输出「我认为掌握了」）
+
+三个维度：`listening`（09 的可靠听写证据）、`recognition`（原语境理解）、`production`（新语境开放产出）。
+
+| 判定 | 条件 |
+|:--|:--|
+| **会** | recognition=pass **AND** production=pass **AND** 至少经过 2 个不同语境 |
+| **半会** | recognition pass + production fail／反向／**只通过选择题**／听写持续失败但语义掌握／两题证据冲突 |
+| **不会** | **至少两个独立证据失败**，或用户主动点「我不知道」 |
+| 附加 | 若 `listening` 仍失败，整体显示 **`半会 · 认识，但原声里还听不稳`** |
+
+**一题翻译错，不能直接判不会。**
+
+### 5.4 怎么避免「猜对＝掌握」
+1. **选择题永远不能单独把状态升到「会」**；
+2. 「会」必须包含一次开放产出；
+3. 至少两个不同语境；
+4. 同一原句重复答对**不增加掌握维度**，只算重复曝光。
+5. AI 对开放答案只返回结构化结果：`pass / partial / fail + reasonCode`（如 `WRONG_SENSE`、`BAD_COLLOCATION`、`WRONG_FORM`、`GRAMMAR_ERROR`），**不输出神秘的「掌握度 83%」**。
+
+### 5.5 离线要求
+句级发现、候选聚合、听写证据、升入 SRS **全部离线可用**；文章级 AI 总结与诊断可消失，且**不得阻塞任何听力行为**。
+
+---
+
+## 六、AI 制定学习计划
+
+### 6.1 「学习」的本质（先定义，否则计划必然做歪）
+
+一个词真正学会＝**听到能识别 → 语境中能取回意义 → 延迟后还能取回 → 换语境还能正确使用**。
+即**成功的提取（retrieval）+ 迁移（transfer）**，不是「看过信息」。
+
+**明确的伪学习**：只看中文释义／连续读 AI 长解释／只做选择题／在同一句里连答十次／AI 一次性批量生 100 张卡／看到提示说「我懂了」／**把 09 的文本音变提示当成真实声学诊断**。
+
+### 6.2 组件白名单（只给 7 个，AI 不得自创）
+
+`original_relisten`（原声回听）／`dictation_retry`（听写这一句）／`cloze_recall`（英文 Cloze 回忆）／`context_transfer`（新语境辨义）／`sentence_production`（造句/交流）／`grammar_repair`（形态搭配语法纠错）／`srs_review`（纯 SRS）。
+
+AI 返回的是 `skill state + reasonCodes + recommendedComponentIds`，**不是 Flutter widget**；App 再校验。
+→ 防止 AI 今天显示一个轮盘、明天生成一个「词汇冒险游戏」。
+
+### 6.3 组件选择规则（可直接写成规则引擎）
+
+| 条件 | App 出什么 |
+|:--|:--|
+| 听写 `missing`/`replaced` 且 `uncertain=false` | `original_relisten` + `dictation_retry` |
+| `spelling` | `cloze_recall`（**不自动判听力差**） |
+| `morphology` | `grammar_repair` + `cloze_recall` |
+| `merged`/`split` | `original_relisten` + `dictation_retry`，目标优先按 **phrase/chunk** 处理 |
+| 听写 `uncertain=true` | **只出** `original_relisten`；**禁止**自动生成精确词计划 |
+| 原语境语义诊断失败 | `cloze_recall` + `context_transfer` |
+| 原语境会、新语境不会用 | `sentence_production` |
+| 造句目标词对但形态/搭配错 | `grammar_repair` |
+| 选择题答对、无开放产出 | `sentence_production`，状态**保持半会** |
+| 已判「会」，SRS 到期 | 只出 `srs_review` |
+| 已判「会」，SRS 未到期 | **什么都不出** |
+| 仅手动点存、无其它证据 | 留候选池，**什么都不出** |
+| AI 不可用但有听写证据 | 本地 `original_relisten`/`dictation_retry`/`cloze_recall` |
+| AI 不可用且只有裸候选 | 什么都不出，等用户主动学或联网诊断 |
+
+**硬约束：一个词一次 session 最多显示 2 种组件。** 否则「多样化学习」会变成「每个词做七个小游戏」。
+
+### 6.4 SRS 与多样化训练的分工
+
+**SRS 决定「什么时候回来」；诊断状态决定「回来后练什么」。** AI 不发明复习日期。
+
+示例节奏：首次确诊不会 → 原声回听 + Cloze；第二次到期若 Cloze 已过但 production 未验证 → SRS + 新语境造句；连续成功且无新错误 → 只做纯 SRS；日后新听写又漏 → 重新触发原声回听 + 听写。
+
+---
+
+## 七、音频选型（本轮结论 + 质检证据）
+
+### 7.1 结论：**TED-Ed《Music and creativity in Ancient Greece》**（`dist/teded-greek-music.lllesson`）
+
+| 项 | 实测 |
+|:--|:--|
+| 语言 / 体裁 | 英语 · 讲解（符合四步法「演讲/讲解」选材标准，**不是影视剧**） |
+| 规模 | **36 句 / 271 秒（4.5 分钟）** —— 恰好是「一篇」的量级，一次能听完 |
+| 音画 | 内含 `audio.m4a`；已挂 B 站视频 `BV1Gf4y1y7wc`（**该类视频此前已验证可正常播放**） |
+| 词汇画像 | 324 个词形 / 552 词次；**90 个只出现一次的长词**（`arguably`、`barbarian`、`civilisation`、`accompany`、`degenerate`、`gibbering`…）→ 生词密度足够做演示 |
+| 复现词 | `ethos`、`civilization`、`music` 等多次出现，适合观察「同词多语境」 |
+
+备选：`dist/gettysburg.lllesson`（10 句 / 100 秒；转写与权威原文**逐字一致**，但词汇偏古雅）。
+
+### 7.2 质检发现与修正（**已应用，2026-09-23**）：该课程包转写有 6 处真错词
+
+用官方逐字稿（TED-Ed 课程页 / 公开 ESL 站点）做全量比对，**700 词 vs 698 词，相似度 0.9785，差异 14 处**：
+
+| # | 类型 | 课程包 ❌ | 官方 ✅ |
+|:--|:--|:--|:--|
+| 1 | **错词** | `liars` | `lyres` |
+| 2 | **错词** | `genes` | `jeans` |
+| 3 | **错词** | `dragon's laying` | `dragon slaying` |
+| 4 | **错词（改义）** | `a moral barbarian` | `amoral barbarian` |
+| 5 | 介词错 | `one at the most famous` | `one of the most famous` |
+| 6 | 冠词错 | `through a common medium` | `through the common medium` |
+| 7 | 多词 | `just obsessed with music as we are` | `just as obsessed…` |
+| 8–10 | 英美拼写 | `categorise / civilisation / civilised` | `categorize / civilization / civilized` |
+| 11 | 英美拼写 | `theatre` | `theater` |
+| 12–14 | 数字写法 | `three / thirteen / nine` | `3 / 13 / 9` |
+
+**为什么这条必须先修**：生词本会把用户点选的词原样存下来。若用户在 `genes` 上点「存」、或听写时把 `jeans` 写成 `genes` 被判错，**系统就在教错词**。8–14 属可接受差异（英美变体/数字写法），1–7 必须修。
+
+**修正结果**：已对句 4 / 12 / 15 / 27 / 35 应用 5 处修正（含 `a common medium → the common medium` 与去除句中多余逗号）；
+参考稿与课程包词级相似度 **0.9785 → 0.9893**；剩余 8 处差异全部为英美拼写（`categorise/civilisation/civilised/theatre`）与数字写法（`three/3`），**非错误，保留**。
+原包已备份为 `dist/teded-greek-music.lllesson.bak-20260923`。
+
+> ⚠️ **一个重要教训**：参考稿只能当**证据**，不能当**圣旨**。本次差异中 `just as obsessed`（课程包）vs `just obsessed`（参考稿）—— **课程包才是对的**，参考稿漏了一个 `as`。修正前必须逐条人工确认，不可脚本盲改。
+>
+> 校验工具：官方逐字稿 `D:/Work/gh-sync/_teded_official_transcript.txt` + difflib 词级对齐脚本。同法可用于质检**任何**新导入课程 —— 建议把「导入后转写质检」做成制课管线的固定关卡。
+
+---
+
+## 八、附属层不得挤占核心：红线清单
+
+| ✅ 允许 | ❌ 不允许 |
+|:--|:--|
+| 精听字幕在**用户主动开启**积累模式后可点词 | 顶部永久新增一个巨大的「生词」主按钮 |
+| 点词后**音频继续** | 点词**自动暂停** |
+| 点词后**轻提示「已存」** | 点词**弹半屏词典** |
+| **二级菜单**进入积累模式 | 新增底部「生词」L1 tab |
+| 听写 `reviewing` 后从错误词加入候选 | 听写 `entering` 时出现可点击字幕 |
+| **原片 snippet** 作为词卡声音 | TTS 替代原片 |
+| Library 二级页统一管理生词 + 闪卡 | 精听页直接展示每日 SRS 任务 |
+| AI 离线消失 | AI 故障导致无法保存 / 回听 |
+
+**最尖锐那个问题的答案**：**保存行为允许发生在精听页；但「生词本功能入口」不允许成为精听页一级主操作。** 这是同时满足 08 红线与「边听边存必须够快」的唯一合理切法。
+
+---
+
+## 九、要纠正的既有文档（GPT 指出 + 已核实）
+
+**03 文档**
+1. **所谓 English-Only 并不真的 English-Only**：正面模板写了中文「连读提示」，背面直接展示 `Sentence_ZH`。若目标真是「正面零中文」，模板至少要重新命名，不要继续叫 English-Only。
+2. **把四类音变写成 AI 可从打星句「自动提取」的特征，语气是确定性的** —— 与 09 已收缩的口径冲突，**以 09 为准**（只能说「可能」）。
+3. **仍把 Groq 公网当正式架构并宣称「毫秒级」** —— 与当前手机网络现实、以及已落地的 MiMo 直连方向脱节。**03 应标记为旧架构**，不再作为 AI 诊断新功能的基础契约。
+
+**07 文档**
+4. 把 `<10min → 1d → 3d` 写成现有 learning steps，**不准确**：当前实现是 **rating 行为**（Again 10 分钟；Good 第一次 1d、第二次 3d），不存在独立 learning-step 状态机。
+5. `10 新卡 / 100 复习` 已被 08 新定调覆盖为 **5 / 30**，不能再当基线。
+6. 数据模型仍默认「一句一张卡」，**没有考虑一句多词**；而 service 恰好按句覆盖 → **直接阻塞生词本**。**必须先修模型，再做 UI。**
+
+---
+
+## 十、待拍板
+
+1. **音频就用 TED-Ed 这一课？** 若是，我下一步把 1–7 处转写修正落进课程包（保持句轴时间戳不变）并重新打包。
+2. **生词积累模式的入口放二级菜单**（GPT 建议）还是做成顶栏第三个小图标（更快但要占位）？
+3. **每段/每篇的候选上限**定多少？（GPT 建议诊断一次最多 5 个词）
+4. **VocabularyItem 与 AnkiCard 的关系**：确认走「生词本体 + 上下文证据」两层、Anki 作为下游？（这会改动现有 `createAnkiCardFromSentence` 的按句判重逻辑）
+5. 「学习计划」首版做到哪一步：只做**组件选择规则表**（E2），还是一并做**节奏编排**（E3 的多次到期编排）？
+
+---
+
+## 十一、决策记录（2026-09-23 用户拍板）
+
+| # | 问题 | 决定 |
+|:--|:--|:--|
+| 1 | 音频选型 | **用 TED-Ed《Music and creativity in Ancient Greece》做测试文档**（转写已修正并重新打包） |
+| 2 | 生词积累 | **可以做** |
+| 3 | 入口图标层级 | **作为三级图标** —— 必须先把一/二/三级页面与菜单的结构处理干净（见 §十二） |
+| 4 | 单次诊断候选上限 | **5 个词** |
+| 5 | 两层模型 | **采纳**（`VocabularyItem` + `VocabularyOccurrence`，详见 §十三） |
+| 6 | 首版学习计划范围 | **先做小部分** —— 只做本地规则映射，不做 AI 出题（详见 §十四） |
+
+---
+
+## 十二、三级结构（页面与菜单同构）
+
+**原则**：层级必须一致可推——一级页面配一级菜单，二级页面配二级菜单，三级只放**动作与开关**，不得再有第四级。
+
+| 层级 | 页面 | 菜单 / 入口 | 内容 |
+|:--|:--|:--|:--|
+| **L1** | 底部主导航 4 页 | 一级菜单＝底部 tab | 课程 Library ／ 精听 Listen ／ 创建 Create ／ 设置 Settings |
+| **L2** | 页面内主分区 | 二级菜单 | Library：课程列表 → **课程详情**；**今日计划 ／ 生词本 ／ 闪卡复习**（管理类都归 Library）<br>精听页：顶栏图标 + **「⋯」面板**<br>设置：七大分组页 |
+| **L3** | — | 三级菜单 / 动作 | 「⋯」面板里的 **生词积累模式**（开关）<br>积累模式内：点词保存 ／ 再点取消 ／ 长按拖动选短语（动作）<br>听写页：提交本段 ／ 重写本段（动作） |
+
+### 两个反复被讨论的落位，按此规则一次定死
+
+* **听写（核心层）＝ L2 直达**：顶栏图标，符合 08「核心操作不得深于 1 层」。
+* **生词积累（附属层）＝ L3**：进「⋯」二级面板，符合 08「附属只能二级入口」+ 本次「图标作为三级」的要求。
+
+> 二者看似冲突，其实是**同一条规则的两面**：**核心允许 L2 直达，附属一律下沉到 L3。** 顶栏不会因此被附属功能塞满。
+
+```
+精听页（L1 页面）
+ └─ 顶栏：听写图标（L2 直达）  ·  ⋯（L2 菜单）
+                                   └─ 生词积累模式（L3 开关）
+                                        └─ 点词保存 / 撤销（L3 动作）
+```
+
+---
+
+## 十三、两层模型详解：`VocabularyItem` vs `VocabularyOccurrence`
+
+### 13.1 一句话区别
+
+| | `VocabularyItem` | `VocabularyOccurrence` |
+|:--|:--|:--|
+| 回答的问题 | **「这个词是什么」** | **「这个词在哪儿被遇到过、当时发生了什么」** |
+| 粒度 | 一个**词 / 短语** | 一次**上下文证据** |
+| 数量 | 1 份 | **N 份**（一对多） |
+| 判重键 | `normalizedTerm`（跨课程、跨句子合并） | `(itemId, lessonId, sentenceId, 字符 span)` |
+| 生命周期 | 长期存在，跨课程累积 | 随课程/句子产生，只增不改 |
+| 谁读它 | 复习调度（SM-2）、生词本列表、今日计划 | 组件选择规则、证据展示、"回原声"跳转 |
+
+**关系**：`1 个 Item ↔ N 个 Occurrence`。
+
+### 13.2 为什么必须分开（三个都来自真实缺陷，不是理论洁癖）
+
+**① 同一个词在多处出现会"碎成多条"**
+只做一层（每个「词+句」一条记录）时，`barbaric` 在课程 A 第 10 句、课程 B 第 88 句会被记成**两条互不相关的记录**。后果：闪卡里出现两张 `barbaric`，复习时间各自独立，**掌握度永远无法累积**——第 3 次遇到它时，系统还以为这是新词。
+
+**② 一句里有多个生词会互相覆盖（现有代码的真实缺陷）**
+`AnkiCard` 挂在句子上，判重是 `lessonId + sentenceIndex`：
+
+```dart
+final existingIndex = _ankiCards.indexWhere(
+  (c) => c.lessonId == lesson.id && c.sentenceIndex == sentence.index,
+);
+```
+
+→ 同一句里点存第二个词，会**覆盖**第一个。两层模型下，同一句可以生成 2 个 Occurrence，分别指向 2 个不同 Item，**互不覆盖**。
+
+**③ 证据来源不同、结论也不同**
+「用户点选的」「听写漏掉的」「AI 判不会的」可能是**同一个词**，但发生的时间、句子、错误类型完全不同。混在一层，就永远说不清**这个词到底哪儿不行**——而 09 已经证明「听写错 ≠ 不认识这个词」（漏 `the` 可能是弱读没听清；`walked→walk` 是词尾；拼错可能只是不熟拼写）。
+
+### 13.3 字段分工
+
+| `VocabularyItem`（1 份） | `VocabularyOccurrence`（N 份） |
+|:--|:--|
+| `id` / `surfaceForm` / `normalizedTerm` | `lessonId` / `lessonTitle` |
+| `kind`: word / phrase | `sentenceId` / `sentenceIndex` / `sentenceText` |
+| **`status`**: candidate/learning/known/ignored | `startMs` / `endMs` / `audioPath`（**回原声用**） |
+| `englishDefinition?` / `chineseGloss?` | `charStart` / `charEnd`（**点词命中用**） |
+| `aiUsageNote?` | **`source`**: tap / dictation / ai |
+| `createdAt` / `lastSeenAt` / **`seenCount`** | `dictationDiffType?` / `expected?` / `actual?` |
+| `ankiCardIds`（调度挂在这里） | `uncertain` / `causeHints`（音变提示） |
+
+**三条派生规则**（决定实现顺序）：
+
+1. `Item.status` **由 Occurrence 汇总推导**，不是手填（候选→学习中→已掌握/忽略）。
+2. `Item.seenCount` = 它的 Occurrence 数量（**重复点同一个词不再产生新 Item，只是 seenCount+1**）。
+3. **SM-2 调度挂在 Item 级** —— 即**一个词一张卡**，而不是一句一张卡。这是与现状最大的结构差异。
+
+### 13.4 用 TED-Ed 这一课走一遍（具体例子）
+
+```
+用户在第 10 句听到 barbaric → 点词保存
+   Item      : { term: "barbaric", status: candidate }
+   Occurrence: { itemId, lesson: teded-greek-music, sentence: 10,
+                 span: [charStart, charEnd], source: tap }
+
+后来听写第 35 句，把 amoral 写成了 a moral → 判定为错误
+   Item      : { term: "amoral", status: candidate }
+   Occurrence: { itemId, sentence: 35, source: dictation,
+                 diffType: replaced/spelling, expected: "amoral", actual: "a moral" }
+
+同一课又出现 barbarian（不同词形）
+   → V1 **不合并**（lemma 归并留到以后，因为 GPT 明确建议
+     「不要把 AI 生成的 lemma/sense 当主键，否则离线判重不稳定」）
+
+用户在另一课又点存 barbaric
+   → **不新建 Item**，只加 Occurrence#3
+   → Item.seenCount 变 2，status 可由 candidate → learning
+```
+
+**一句话对照**：`Item` 是"词典里那一行"，`Occurrence` 是"你在哪些句子、哪一秒、因为什么原因碰到过它"。
+
+---
+
+## 十四、首版学习计划（v1）—— 只做本地规则映射
+
+### 14.1 范围（做）
+
+**输入信号只取两类**（都不依赖 AI）：
+1. **听写证据**（来自 09，本地已有）：`dictationDiffType`
+2. **手动点存**（候选池）
+
+**组件只用 4 个**（纯本地可判定）：
+`original_relisten`（原声回听）／`dictation_retry`（听写这一句）／`cloze_recall`（英文 Cloze 回忆）／`srs_review`（纯 SRS）
+＋ `morphology` 时的**本地纠错展示**（`grammar_repair` 的简化版，只展示正确形态，不判开放答案）。
+
+**输出**：Library 二级页「**今日计划**」—— 一个列表，每项 ＝ `词 + 1~2 个组件按钮`，点进去执行。
+
+**规则表（v1 全部规则，可直接实现）**
+
+| 条件 | 出什么 |
+|:--|:--|
+| 听写 `missing`/`replaced` 且 `uncertain=false` | `original_relisten` + `dictation_retry` |
+| `spelling` | `cloze_recall`（**不判听力差**） |
+| `morphology` | 本地纠错展示 + `cloze_recall` |
+| `merged`/`split` | `original_relisten` + `dictation_retry`（按 chunk 处理） |
+| `uncertain=true` | **只**出 `original_relisten` |
+| 仅手动点存、无其它证据 | **什么都不出**，留候选池 |
+| 已判「会」且 SRS 到期 | 只出 `srs_review` |
+| 已判「会」且未到期 | **什么都不出** |
+
+**三条硬约束**：① 一个词一次最多 2 个组件；② 受 SRS 配额约束（新卡 5 / 复习 30）；③ 执行组件后**回写成功/失败证据**，供下次规则判定。
+
+### 14.2 范围外（留给 v1.5+）
+
+* AI 出题与**开放答案评判**（`context_transfer` / `sentence_production` / `grammar_repair` 的判定）
+* 多次到期的**节奏编排**（SRS 决定何时回来，诊断状态决定练什么 —— 编排属增强）
+* lemma 归并、短语词典（本地 phrase lexicon 只能给建议，不得偷改用户的点选）
+* 文章级 AI 汇总
+
+### 14.3 v1 验收标准（可测）
+
+1. **断网可用**：飞行模式下能生成今日计划并完成全部组件；
+2. **可解释**：每个组件都能回答"因为哪条证据"；
+3. **不制造复习债**：仅点存、无证据的词**不出组件**；
+4. **一次最多 2 组件**；
+5. 不做任何 AI 出题也能跑通完整闭环（点存 → 候选池 → 今日计划 → 执行 → 回写证据）。
+
+---
+
+## 十五、落地记录（2026-09-23 · 第一批）
+
+### 15.1 已交付
+
+| 文件 | 职责 |
+|:--|:--|
+| `lib/models/vocabulary_model.dart` | 两层模型：`VocabularyItem`（词本体）+ `VocabularyOccurrence`（上下文证据）、三个枚举、`normalizeTerm()`、JSON 往返 |
+| `lib/models/subtitle_token.dart` | **保留字符位**的分词器：`surface / normalized / charStart / charEnd / tokenIndex`，含 `tokenAt()` 命中测试与 `phraseFor()` 短语圈选（2–5 词） |
+| `lib/data/vocabulary_store.dart` | 两级判重 + toggle + 状态转移 + **持久化**（`SharedPreferences` 键 `listenloop:vocab_items`），写盘串行化 |
+| `lib/training/vocabulary_plan.dart` | **v1 学习计划规则引擎**：纯本地、可解释、组件上限 2、SRS 配额 |
+| `lib/screens/vocabulary_book_screen.dart` | 生词本管理页（Library 二级）：汇总 / 今日计划 / 筛选 / 行内管理 / 证据面板 |
+| `lib/widgets/sentence_display.dart` | 字幕逐词可点（`accumulationMode` 默认关闭，用 `WidgetSpan`） |
+| `lib/screens/listening_screen.dart` | 顶栏「⋯」→ 生词积累模式（三级开关）；`jumpToSentence()` 供回原声 |
+| `lib/screens/library_screen.dart` | 生词本入口（带计数）+ 回原声导航 |
+| `lib/screens/root_shell.dart` | **全应用共享**一个 `VocabularyStore`；`ActiveLessonSession` 增加 `startSentenceIndex` + 请求序号 |
+
+### 15.2 这一批做出的三处设计裁决
+
+**① 今日计划与词条列表放在同一页。** 两者是同一件事的两个视角（"我今天练什么" / "我总共存了什么"），拆成两个二级入口只会让用户来回横跳。等闪卡复习上线、入口变多时再拆。
+
+**② Library 入口只在生词本非空时出现。** 空生词本不该在课程列表上占一行；新用户的第一条引导放在积累模式的提示文案里。入口行直接给出「候选 N · 今日计划 M」，不点进去也能看出有没有事要做。
+
+**③ 回原声 = 退出二级页 + 落到证据句 + 开播。** 实现上给 Shell 增加了 `onOpenLessonAtSentence` 回调，并在 `_ListenTab.didUpdateWidget` 里做**同课显式跳转**——因为课程没变时 `GlobalKey` 不重建，`initialSentenceIndex` 只在 `initState` 读一次，只传参数会静默停在原句。
+
+> **★ 测试抓到的一个真实交互断层**：第一版实现里，用户在生词本页点「回原声」后，音频确实跳转开播，但**眼前的页面没变**（二级页仍压在 Shell 之上）——声音在后台响而画面毫无反应。修法是在回调前 `Navigator.of(context).maybePop()` 退出二级页。这类"功能对、观感断"的缺陷只有把 Shell 与页面一起 pump 起来才测得出来。
+
+### 15.3 v1 规则表的一处**超出原设计**的补充
+
+`DictationDiffType.extra`（多写）在原规则表里没有对应行。裁决：多写意味着用户**听到了原文里没有的东西**，属听辨问题而非拼写问题，因此按听辨处理但**只给原声回听、不给重听写**——「重写一遍」对「多写」没有针对性（他不知道该少写哪个）。`matched`（命中）则什么都不出。二者均已在代码注释与测试中显式标注。
+
+### 15.4 验收对照（§14.3 五条）
+
+| 验收标准 | 状态 |
+|:--|:--|
+| ① 断网可用 | ✅ 全部逻辑本地：判重、状态机、计划规则均无网络调用 |
+| ② 可解释 | ✅ `PlanReason` 唯一出口，UI 不得自行拼条件；页面直接显示「依据: …」 |
+| ③ 不制造复习债 | ✅ 仅点存无证据 → 不出组件（有专门测试） |
+| ④ 一次最多 2 组件 | ✅ 引擎内强制截断（`maxComponentsPerItem`） |
+| ⑤ 不做 AI 出题也能闭环 | ✅ 点存 → 候选池 → 计划 → 证据面板 → 回原声 |
+
+### 15.5 未做（下一棒）
+
+- 长按拖动圈短语（`phraseFor` / `phraseSpan` 已就绪，UI 未接）
+- 组件的**执行页**（回原声/重听写/Cloze 目前只有建议标签，点了还没有落地页）
+- 闪卡复习入口（`EPIC-04` 既有的 `AnkiReviewDialog` 仍是按句判重的老模型）
+- lemma 归并与 phrase lexicon
+- AI 出题与开放答案评判（v1.5）
+
+---
+
+## 十六、落地记录（2026-09-23 · 第二批：圈短语 / 执行页 / 闪卡复习）
+
+### 16.1 长按拖动圈短语
+
+| 文件 | 改动 |
+|:--|:--|
+| `lib/models/subtitle_token.dart` | 新增 `SubtitleSelection` + `SubtitleTokenizer.selectionFor()`（短语选择的**可测载体**，不掺业务语义） |
+| `lib/widgets/sentence_display.dart` | `_TappableEnglish` 改为 StatefulWidget：长按锚定一个词、拖动按命中词扩展；`onPhraseSelected` 回调 |
+| `lib/screens/listening_screen.dart` | 接 `_onPhraseSelected` → 与点词**同一条存储路径**；「⋯」菜单补长按提示（隐藏手势不写出来没人会试） |
+
+三条实现约束（都是踩过才写下的）：
+
+1. **命中测试靠每个词的 `RenderBox` 矩形，不靠文本偏移** —— 词是 `WidgetSpan` 占位符，段落里的字符下标对不上真实字符位置。
+2. **选中高亮必须走 `TextStyle.backgroundColor`**，不能用 Container 加内边距：否则选中瞬间文字重排，"手指底下的词"会跑掉。有一条专门的测试断言"高亮时词的位置不变"。
+3. **超过 5 个词时夹紧而不是作废** —— 手指继续滑不该让选择突然消失。
+
+行为细节：只圈到 1 个词也回调（交给调用方按单词处理，避免"长按了却没反应"）；同一区间再圈一次 = 取消保存（与点词一致）；**单词与短语是两个词条**（判重键含字符区间）。
+
+### 16.2 学习组件执行页（今日计划的落地页）
+
+| 文件 | 职责 |
+|:--|:--|
+| `lib/training/vocabulary_drill.dart` | **本地判定**：`ClozePrompt` 构造 + `judgeCloze` / `judgeSentenceDictation` / 自评；`DrillHint` 六类提示 |
+| `lib/screens/vocabulary_drill_screen.dart` | 按 `PlanEntry.components` 逐步执行：原声回听 → 单句听写 → Cloze 回忆 → 形态纠错 |
+| `lib/models/vocabulary_model.dart` | 新增 `VocabularyDrillLog` + `VocabularyItem.drills`（**Item 级**） |
+| `lib/data/vocabulary_store.dart` | `recordDrill()`（§14.1 硬约束 ③ 执行后回写） |
+
+四条硬规则：
+
+* **每步完成立刻落盘**（不是整轮结束才写）——中途退出不丢已练的部分，有专门测试；
+* **听写提交前不显示原文**（锁字幕），提交后才揭晓；
+* **自评就写自评**：原声回听没有客观对错，界面上明说，且 `accuracy` 记为 1 或 0 —— 不伪造测量值；
+* **只用原片句轴切片**（`JustAudioFacade` + `SentenceClip[startMs, endMs]`），08 红线。
+
+两处刻意分开的判定：
+
+| 现象 | 提示 | 为什么分开 |
+|:--|:--|:--|
+| 差一点拼写 | `spelling` | 听清了，是词形没记准 → 重听帮不上忙 |
+| 写成别的词 | `wrongWord` | 没听出来 → 需要回原声 |
+
+形态纠错步骤直接告诉用户「这次错在词尾形态，重听帮不上忙」——避免让他去做无效努力。
+
+### 16.3 闪卡复习接入 Item 级模型（**一个词一张卡**）
+
+| 文件 | 职责 |
+|:--|:--|
+| `lib/models/vocabulary_model.dart` | 新增 `VocabularySrs`（SM-2：reviews / intervalDays / easeFactor / dueAt / **lapses**）+ `ReviewRating` 四档 |
+| `lib/data/vocabulary_store.dart` | `recordReview()` / `dueForReview()` / `newReviewCards()` |
+| `lib/training/vocabulary_plan.dart` | 新增 `VocabularyReviewQueue`（到期 + 新卡，配额 5/30）；planner 的 `dueAt` **默认读 `item.srs?.dueAt`** |
+| `lib/screens/vocabulary_review_screen.dart` | 复习会话：正面挖空 → 翻面看答案 → 四档评级 → 小结 |
+
+调度手感与旧闪卡（`AnkiCard`）完全一致（Again 10 分钟、Good 1/3/…、Easy 3/7/…、ease 夹 1.3~3.0、间隔 ≥21 天算已掌握），差别只在**挂在哪**：
+
+| | 旧 `AnkiCard` | 新 `VocabularyItem.srs` |
+|:--|:--|:--|
+| 判重键 | 课程 + 句号 | **词形**（跨课程合并） |
+| 同一个词出现两次 | 两张互不相干的卡 | **同一张卡**，掌握度会累积 |
+| 遗忘次数 | **没有这个字段** | `lapses` 显式记录 |
+| 评级历史 | 无 | `VocabularyDrillLog(component: 'srsReview')` |
+
+> 旧体系**本轮未动**（避免破坏既有链路），两套暂时并存。迁移/下线是下一棒。
+
+### 16.4 本轮被测试抓出来的三个真问题
+
+1. **同一毫秒内多条记录按 `createdAt` 排序不可靠** —— `lastDrill` / `consecutivePasses` / `latestOccurrence` 原本按时间比较，快速连点或测试里会得到不确定结果。改为**以追加顺序为准**（列表只增不改，顺序天然就是时间顺序）。
+2. **已有卡但被退回候选池的词仍被催复习** —— 队列原本只在"没有卡"的分支里排除候选池。用户把词退回候选池就是"暂时不想学"，此时拿复习卡催他等于自己制造复习债。已改为**候选池整体排除**（存储层与队列层同一口径）。
+3. **练习记录不能塞进 `VocabularyOccurrence`** —— occurrence 的判重键是上下文位置，同一处反复练会被判重吞掉；而"练了三次仍然错"恰恰最该留下。因此单独立 `VocabularyDrillLog`（Item 级，不做判重）。
+
+### 16.5 验收对照
+
+| 标准 | 状态 |
+|:--|:--|
+| 断网可用（圈短语 / 执行页 / 复习页） | ✅ 全部判定本地，无网络调用 |
+| 只用原片音频 | ✅ 执行页与复习页都播 `SentenceClip[startMs, endMs]` |
+| 每步回写证据 | ✅ `recordDrill` / `recordReview`，且**逐步**落盘 |
+| 不伪造测量 | ✅ 自评步骤明标自评；不可靠对齐只给整体结果 |
+| 一个词一张卡 | ✅ `srs` 挂在 `VocabularyItem`，跨课程合并 |
+
+### 16.6 未做（下一棒）
+
+- 旧 `AnkiCard` 与新模型的**迁移或下线**（当前两套并存，Library 的 Anki 横幅仍指向旧体系）
+- 组件通过后**自动提升状态**？ —— 目前刻意不做：状态只由显式动作转移（派生规则 1），练对两次不该偷偷把词标成"已掌握"
+- lemma 归并与 phrase lexicon
+- AI 出题与开放答案评判（v1.5）
+
+
+## 十七、落地记录（2026-09-25 · 弱项优先复习排序）
+
+对应 [07 号文档 §三.2](07_Anki%E9%97%AA%E5%8D%A1%E7%AE%A1%E7%90%86%E4%B8%8E%E5%A4%8D%E4%B9%A0%E7%AD%96%E7%95%A5%E8%AE%BE%E8%AE%A1.md) 的差异化卖点「弱项优先」。EPIC-04 推进的第一片。
+
+### 17.1 设计对应关系（07 原文 → Item 级实现）
+
+07 原文按**音变类型**错误率排序 —— 那是句子级卡的口径（音变标注挂句上，04 的四大音变规则表尚未落地）。Item 级词卡的对应物：
+
+| 07 概念 | Item 级实现 | 权重 |
+|---|---|---|
+| 错误率 | `srs.lapses`（遗忘次数） | 每次 1.0 |
+| 错误率 | `srs.easeFactor` 低（1.3~3.0 → 0~1.7 分） | 线性 |
+| 错误率 | `VocabularyDrillLog` 失败次数 | 每次 0.5，**封顶 2.0 防刷分** |
+| 到期权重 | 拖欠天数线性封顶（30 天 → 2.0 分） | 防久拖强卡被**永久**压住 |
+
+排序键 = 错误信号 + 到期权重，降序；同分按 `dueAt` 升序保证稳定可复现。权重为设计参数（07 原文只给公式未给数值），调参只动 `weaknessScore` / `overdueWeight` 两个纯函数。
+
+### 17.2 边界（刻意保持的）
+
+* **只改出现顺序与配额占用**（>30 张到期时弱项先占坑），**不改队列构成** —— 到期就是到期，弱项不会把没到期的卡拉进来；
+* `vocabulary_store.dueForReview()` 保持纯 `dueAt` 序 —— 存储层只回答"谁到期"，"谁先出现"是队列层的决策；
+* `weaknessFirst: false` 开关保留纯时间序，作为对照与回退。
+
+### 17.3 验证
+
+新增 4 项测试（同到期弱项先行 / 练习失败信号 / 拖欠封顶平衡 / 关开关回退），既有队列测试（先到期后新卡、配额截断）在新排序下**语义不变自然通过**。全量 `flutter test` **482 项通过**，`dart analyze lib/ test/` 0 issue。
+
+## 十八、落地记录（2026-09-25 · AI 出题第 3 题：冲突消解）
+
+§5.2「第 3 题 · 仅冲突时」的落地 —— 两题证据冲突（一过一不过）时，出**一道对比/纠错任务**消解冲突。
+
+* **触发条件**：
+eedsConflictResolution(recognitionPass, productionPass) —— 一过一不过；双 fail（=不会）与双 pass 不触发；
+* **题面生成**：uildConflictPrompt 要求 LLM 出最小对比对或改错句（严格 JSON {"conflictTask": ...}，英文 ≤30 词、一句可答）；执行页新回调 loadConflictQuiz 接线（i_quiz_launcher.dart 共用）；
+* **判定映射升级**：masteryVerdict 加 conflictResolved 参数 —— 冲突 + 第 3 题通过 = 第 3 个语境证据补齐 → 升「会」；未通过 / 没出（取题失败自动跳过，§5.5 红线）= 维持半会；双 fail 不受影响；
+* **落盘**：第 3 题以 stage=conflict 进 VocabularyDrillLog，与 recognition/production 同一组件流。
+
+验证：新增 7 项测试（触发条件 / 升会 / 维持半会 / null 兼容 / 双 fail 不变 / prompt 契约 / 解析容错），全量 lutter test **511 项通过**，dart analyze lib/ test/ 0 issue。
+## 十九、落地记录（2026-09-25 · lemma 词形归并）
+
+13 号设计稿四项按推荐拍板（方案 A 导入时归并 / ~180 不规则词表 / 启动时自动迁移 + 快照兜底 / 还原失败保持独立卡）后动工，当日完成。
+
+* **还原器** lib/training/lemma_normalizer.dart（三层：不规则表 → 规则词尾剥离 → 兜底自身，宁缺勿错）；同形歧义词（leaves/lives）按高频义保留一条；
+* **判重口径统一**：ocabularyMergeKey()（model 层顶层函数）—— word 走 lemma 还原键、phrase 走 p: 前缀独立键空间（同形 word "walk" 与 phrase "walk" 互不吞并）；VocabularyItem.itemKey 与迁移分组共用同一口径；
+* **数据模型**：VocabularyItem / VocabularyOccurrence 加 lemma 字段（JSON 向后兼容，旧档 null 兜底）；
+* **一次性迁移** migrateToLemmaV2()：启动时装载后自动跑（幂等标记）；迁移前整包快照进 SharedPreferences（ocab_items_backup_pre_lemma）；主卡 = 最早创建，occurrences / drills / ankiCardIds 全并入（一条不丢），status 取组内最高（全 ignored 保留 ignored），srs 保留 reviews+lapses 更大者，occurrence 逐条回填 lemma；
+* **phrase 恒不参与归并**（§五 红线）。
+
+验证：还原器 31 项（三层表驱动 + 保守边界）+ 迁移 9 项（三卡归并 / 证据不丢 / status / srs / drills / phrase 隔离 / 幂等 / 快照）+ 存量判重回归，全量 lutter test **551 项通过**，dart analyze lib/ test/ 0 issue，已装机。
+---
+
+## 二十、成熟项目生词本构建策略调研（2026-09-25）
+
+> **本节为恢复版。** 原文因一次误操作整文件覆盖而丢失，依据 `开发日志.md`（2026-09-25 · 生词本构建策略调研）条目逐条重建。调研对象、五条规律、现状对照、优先级、pub.dev 实测五项均为原文事实；若日后找回原文，请以原文替换本节。
+
+### 20.1 调研对象（四类）
+
+| 类别 | 代表 |
+|:--|:--|
+| 挖词产品 | VocabSieve / Migaku / Clozemaster |
+| 阅读型 | LingQ / Readlang |
+| SRS 调度 | Anki / FSRS |
+| Anki 生态 | MorphMan / genanki / vocabsieve-addon |
+
+### 20.2 五条规律（跨项目共识）
+
+1. **「词」与「上下文」必须两层** —— 所有挖词项目的共识（对照 §十三 两层模型）。
+2. **SRS 挂词级不挂句级** —— MorphMan 生态的判重键是词形（不是句子）。
+3. **SM-2 是底线，FSRS 是 2022 年起的标准**：
+   * SM-2：ease 初值 2.5、下限 1.3；Again −0.2 / Hard −0.15 / Good 不变 / Easy +0.15。
+   * FSRS：21 参数神经网络、stability/difficulty 双变量、显式目标保持率（desired retention）。
+   * **但 FSRS 冷启动差** —— 几百条复习历史之前，用 SM-2 更稳。
+4. **词频只参与「学什么」的排序/过滤，不参与「什么时候复习」的间隔数学**（对应 §21.3 三条硬边界第 1 条）。
+5. **已知词反哺内容（LingQ/Migaku 的做法）与 08「听优先」冲突** —— 本轮不做内容反哺，只做非破坏式视觉弱化（见 §23.1）。
+
+### 20.3 现状对照（ListenLoop vs 成熟项目）
+
+已达成熟项目水准的部分：两层模型 / 判重 / 点词保存 / SRS 挂载 / 弱项优先。
+
+**真差距只有两个：**
+1. **完全无词频数据** —— 全 lib 目录搜 `frequency/freq/词频/COCA/BNC/zipf` 零命中（P0 已补上，见 §21）；
+2. **SRS 仍是 SM-2 简化版**（P1 已替换为 FSRS，见 §22）。
+
+### 20.4 优先级（本轮定调）
+
+* **P0** 词频排序/过滤 —— 打包离线词频表作 asset，纯函数读取器，**不覆盖证据模型**。→ ✅ 已完成（§21）
+* **P1** SRS 升 FSRS。→ ✅ 已完成（§22）
+* **P2** 已知词反哺 —— 原判「暂缓」，本轮改做**非破坏式**视觉弱化以守 08 红线。→ ✅ 已完成（§23.1）
+* **P3** Anki 导出（可选）。→ ✅ 已完成守卫（§23.2）
+
+### 20.5 pub.dev 实测（前置条件成立，P1 才敢启动）
+
+* `fsrs` **v2.0.1**，MIT，Flutter 全平台（Android/iOS/macOS/Windows/Linux/Web）。
+* 22 likes / 6.27k 下载，为 `open-spaced-repetition/py-fsrs@6fd0857` 的 **Dart 移植**。
+* API：`Scheduler(parameters: 21权重, desiredRetention, learningSteps, relearningSteps, maximumInterval, enableFuzzing)` → `reviewCard(card, rating)` 返回 `(card, reviewLog)`；`Card` / `ReviewLog` / `Scheduler` 支持 `toMap` / `fromMap`。
+* **结论**：可直接引入，P1 不再依赖 `fsrs-rs-dart` 是否存在。
+
+---
+
+## 二十一、落地记录（2026-09-25 · P0 离线词频表 + 候选池排序）
+
+对应 §20.4 的 P0。**只做了词频**，SRS 升级（P1）与已知词反哺（P2）留待后续。
+
+### 21.1 词频数据源
+
+* **NGSL 1.01（New General Service List）官方发布**：`antdurrant/word.lists` 仓库的 `NGSL+1.01+with+SFI.xlsx`（4,046,430B）。
+* 从 `Wordlist ∈ {1 - NGSL, 2 - Sup}` 筛出 lemma + rank，得 **2801 条**（rank 1 = `the`，rank 2801 = `thirst`）。
+* 落盘 `D:/listenloop/assets/data/ngsl3000.tsv`（UTF-8，`词形\trank`，36,373B），`pubspec.yaml` 已注册。
+* **关键认识**：NGSL 是 **lemma 表**（只存原形，`walked`/`walking` 不在表内，`walk` 在）。查询必须两步——先按 lemma 归一化键查，未命中再查归一化原形兜底（`found` 在表里是独立条目，`lemmaKey('found')='find'` 会漏，必须兜住）。
+
+### 21.2 交付文件
+
+| 文件 | 职责 |
+|:--|:--|
+| `lib/training/word_frequency.dart` | **纯函数**读取器：`parse()` / `rankOf()` / `isHighFrequency()` / `isLowFrequency()` / `priorityOf()`。零依赖、离线、解析一次后 O(1) Map 查询。 |
+| `lib/data/word_frequency_loader.dart` | **唯一碰 `rootBundle` 的 Flutter 层**：`WordFrequencyHolder.load()`，失败静默降级为空表；`inject()` 供测试。 |
+| `lib/training/vocabulary_plan.dart` | `build()` 新增可选 `WordFrequency? frequency`。 |
+| `lib/screens/vocabulary_book_screen.dart` | build 时读 `WordFrequencyHolder.current` 传给 planner。 |
+| `lib/screens/root_shell.dart` | `initState` 里 `unawaited(WordFrequencyHolder.load())`。 |
+| `assets/data/ngsl3000.tsv` | 2801 条 NGSL 词频。 |
+| `test/training/word_frequency_test.dart` | 读取器 11 项测试。 |
+| `test/data/word_frequency_loader_test.dart` | loader 4 项测试（含真实 asset 冒烟）。 |
+| `test/training/vocabulary_plan_test.dart` | 新增「词频排序」4 项测试。 |
+
+### 21.3 排序规则（P0 边界，已写进 planner doc 注释）
+
+* **只作用于候选池之间**：低频优先（`priorityOf` = NGSL rank，未登录词取 1500 中间值）。
+* 同优先级回退「最近见到」；非候选词保持原顺序。
+* **三条硬边界**：
+  1. 词频**不参与** SRS 间隔数学——不动 `dueAt` / `easeFactor` / `intervalDays`；
+  2. 词频**不覆盖**听写证据规则——高频词听错了照样出「原声回听」（听不清高频词恰恰是听力问题）；
+  3. 词频**不改**队列构成——到期的就是到期，低频词不会把没到期的卡拉进来。
+* 传 `null` 时**行为完全不变**（向后兼容，现有测试不受影响）。
+
+### 21.4 未登录词的优先级为什么取 1500（中间偏前）
+
+NGSL 只覆盖核心高频词。**未登录 ≠ 低频**：它可能是 COCA/BNC 前 5 万里的普通词（该先练），也可能是专有名词（不该练）。给中间值既不让生僻词霸榜、也不把它们压到底（压底反而漏掉真正该练的词）。
+
+### 21.5 验证
+
+* `flutter analyze lib/ test/`：0 issue。
+* 新增测试 19 项（读取器 11 + planner 4 + loader 4），**全部通过**。
+* 全量 `flutter test`：**577 项通过**（基线 554 + 新增 23，无回归）。
+### 21.6 装机验证（2026-09-25 · release APK + adb 真机确认）
+
+* **构建**：`flutter build apk --release`（3 ABI，~139MB）。解包校验 `assets/data/ngsl3000.tsv` **已打进 APK**。
+* **装机**：`adb install -r` → Success；`MainActivity` 进入 `topResumedActivity`，PID 存活，logcat 无 crash。release 版不可 debug、无 `run-as`。
+* **词频排序真机验证**（`ted-ed-greek-music` 第 15 句 `but the ancient Greeks saw these disciplines as more than just school subjects.`）：
+
+  | 步骤 | 操作 | 结果 |
+  |---|---|---|
+  | 1 | 更多菜单开启「生词积累模式」 | 开关 `checked=true`，字幕逐词可点 |
+  | 2 | 点 `but` | 底部「✓ 已存 but」，字幕该词带下划线 |
+  | 3 | 点 `disciplines` | 底部「✓ 已存 disciplines」，同样下划线 |
+  | 4 | 课程页看「生词本」入口 | 显示「候选池 2 个词」 |
+  | 5 | 进生词本 | 「候选池 2」列表：**`disciplines` 在上，`but` 在下** |
+  | 6 | 看「今日计划」 | **为空** |
+
+* **判定**：
+  * `disciplines` → NGSL `discipline` rank **1850**（低频）→ 排在 `but`（rank **25**，高频）前面 —— **低频优先，符合设计**；
+  * 「今日计划」为空：两词都无听写错误、未到复习期。说明词频**只重排候选池**，没有越界改变「计划构成」（计划仍仅由听写错误 / 到期驱动），三条硬边界守得住。
+* **结论**：P0 全链路闭环 —— 离线 asset 可加载、读取器真机生效、排序口径正确、边界未越界。**P0 装机验证通过。**
+
+---
+
+## 二十二、落地记录（2026-09-25 · P1：SRS 从 SM-2 升级为 FSRS）
+
+§20.4 的 P1。**替换完成，旧数据平滑迁移，lapse 语义重定义。**
+
+### 22.1 为什么上 FSRS
+
+SM-2（旧实现）只有 4 个参数（easeFactor / intervalDays / reps / lapses），间隔靠倍率硬推：`Again→1 天`、`Hard→1.5×`、`Good→2.5×`、`Easy→3×`。它的假设「同一张卡的相对难度永远不变」在实践中很快失真——同一词在不同句子里的记忆稳定性差异很大。FSRS 用 **21 个可优化参数** + 双变量状态（稳定性 stability / 难度 difficulty），显式建模「这次复习的间隔」与「回忆概率（desired retention）」的关系。
+
+本轮**不做参数拟合训练**（拟合需要大量复习日志），先接 FSRS 默认参数，等复习历史积累后再走 `fsrs optimize`。
+
+### 22.2 依赖与配置
+
+| 项 | 取值 |
+|:--|:--|
+| 依赖 | `fsrs: ^2.0.0`（`pubspec.yaml`，`flutter pub add fsrs` 解决到 2.0.1） |
+| 算法实现 | 移植自 `open-spaced-repetition/py-fsrs@6fd0857`（Dart 版） |
+| 参数集 | FSRS 默认 21 参数 |
+| `desiredRetention` | `0.9` |
+| `learningSteps` | `[10min]` |
+| `relearningSteps` | `[10min]` |
+| `enableFuzzing` | `false`（保证确定性，可测试、可复现；后续可开） |
+
+Learning / Relearning 步长设为 10 分钟，与旧 SM-2 的「Again = 10 分钟后重测」手感一致，用户迁移后无感知。
+
+### 22.3 状态字段与序列化
+
+`VocabularySrs` 新增 `Map<String, Object?>? fsrsState`，保存 FSRS `Card.toMap()` 的全部字段（`due` / `stability` / `difficulty` / `elapsedDays` / `scheduledDays` / `reps` / `lapses` / `state` / `lastReview`）。旧字段 `dueAt` / `intervalDays` **继续保留**，只用于 UI 展示与兼容读取——间隔数学完全交给 FSRS。
+
+```dart
+// VocabularySrs
+final Map<String, Object?>? fsrsState;   // FSRS 卡状态 JSON
+final int lapses;                         // 记忆丢失次数（语义已重定义，见 §22.5）
+final int drills;                         // 听写错误/原声回听次数
+DateTime? get dueAt;                      // 保留，兼容 UI 与旧存档
+double? get intervalDays;                 // 保留
+```
+
+### 22.4 `applyRating()` 现在做什么
+
+```
+applyRating(rating, now)
+  ├─ 1. 旧存档迁移：_migrateToFsrsCard(stamp)      // 仅首次调用时生效
+  ├─ 2. scheduler.reviewCard(card, rating, reviewTime=now)
+  ├─ 3. intervalDays = (next.due - next.lastReview).inDays
+  ├─ 4. lapse 判定：before.state == review && next.state == relearning → lapses + 1
+  ├─ 5. reviews + 1
+  └─ 6. fsrsState = next.toMap()；返回新的 VocabularySrs
+```
+
+`Rating` 四档一一映射：
+
+| 复习页 UI | `ReviewRating` | FSRS `Rating` |
+|:--|:--|:--|
+| 忘了（重测） | `again` | `Again` |
+| 有点难 | `hard` | `Hard` |
+| 记得（默认） | `good` | `Good` |
+| 太简单 | `easy` | `Easy` |
+
+### 22.5 lapse（记忆丢失）语义重定义 —— 关键差异
+
+* **FSRS 语义**：只有当卡从 `Review` 状态跌入 `Relearning` 才算一次 lapse。学习中（Learning）按 Again 只是延长学习步，**不**计 lapse。
+* 旧 SM-2 会把「新卡的 Again」也算一次 lapse（语义含糊），本轮**统一到 FSRS**：`lapses` 只在 Review→Relearning 时 +1。
+* `drills`（听写错误 / 原声回听）保持独立计数，不受影响。
+
+### 22.6 旧 SM-2 存档的平滑迁移
+
+`_migrateToFsrsCard(stamp)` 对**旧格式存档**（无 `fsrsState`）做一次性转换：
+
+| 旧存档条件 | 迁移目标 |
+|:--|:--|
+| 从未评过级（`reviews == 0`） | 全新卡：`state = New → Learning`，FSRS 走学习步 |
+| 已评过级 | `state = Review`、`stability ≈ intervalDays`、`difficulty = _mapEaseToDifficulty(easeFactor)`、`lastReview` 保留（FSRS 用真实 `elapsedDays`） |
+
+ease↔difficulty 反演映射（`ease ∈ [1.3, 3.0]` ↔ `difficulty ∈ [1, 10]`）：
+
+```dart
+// FSRS difficulty → SM-2 ease
+double _mapDifficultyToEase(double d) => 3.0 - (d - 1) / 9.0 * 1.7;
+// SM-2 ease → FSRS difficulty
+double _mapEaseToDifficulty(double ease) => 1 + (3.0 - ease) / 1.7 * 9.0;
+```
+
+即 difficulty=1（最易）↔ ease=3.0；difficulty=10（最难）↔ ease=1.3。已评过级的卡首评时 `elapsedDays` 按真实天数计算，不重置。
+
+> **实现注意（踩坑）**：早期版本用旧 `_srsFactor` / `_computeFactor` 从 SM-2 反算，迁移首评时 `elapsedDays=0` 会算出 NaN（`stability≈intervalDays` 后取 log 溢出）。已删除该逻辑，全部由 FSRS 内部 `_nextInterval` 计算。
+
+### 22.7 实测间隔节奏（`learningSteps=[10min]`, `relearningSteps=[10min]`, `enableFuzzing=false`）
+
+| 场景 | 结果 |
+|:--|:--|
+| 新卡 Again | 10 分钟后重测（学习步） |
+| 新卡 Good | **3 天** |
+| 新卡 Easy | **16 天** |
+| Good × 6 | 3 → 11 → 37 → 112 → 312 → 812 天 |
+| Easy × 6 | 16 → 164 → 1534 → 11509 → 36500（封顶） |
+| 同会话 Again 后 11 分钟点 Good | **约 24 小时**（不是 3 天） |
+
+**短时稳定度（short-term stability）**：当 `elapsedDays < 1`（同一会话内复习），FSRS 走 `_shortTermStability`，因此 Again 后 11 分钟 Good 只给 ~24h，不会直接跳到 3 天。这符合「同会话短重测」的真实记忆曲线。
+
+### 22.8 交付文件
+
+| 文件 | 变更 |
+|:--|:--|
+| `pubspec.yaml` | 新增 `fsrs: ^2.0.0` |
+| `lib/models/vocabulary_model.dart` | `VocabularySrs` 增 `fsrsState`；`applyRating()` 全量改写；新增 `_migrateToFsrsCard` / `_cardId` / `_mapDifficultyToEase` / `_mapEaseToDifficulty` / 静态 `_scheduler`；`ReviewRating.toFsrs` |
+| `lib/screens/vocabulary_review_screen.dart` | 无改动（UI 四档手感不变），`dueAt` / `intervalDays` 兼容读取 |
+| `test/training/vocabulary_srs_test.dart` | 全量改写为 FSRS 语义（25 项测试）：新卡 Again=10min、Good→3 天、Easy→16 天、Good 指数递进（`now` 推进到 `dueAt` 以规避短时稳定度）、lapse 仅 Review→Relearning、JSON 往返、两条旧 SM-2 迁移测试 |
+| `test/data/vocabulary_store_persistence_test.dart` | `intervalDays == 1` → `closeTo(3.0, 0.01)`（FSRS Good=3d） |
+| `test/screens/vocabulary_review_screen_test.dart` | 2 项更新：评级写进 SRS（`dueAt` 前移 + `fsrsState != null`，Again 后 11 分钟 Good ≈24h）；忘了 → 10 分钟（`lapses == 0`，新卡 Again 不计 lapse） |
+
+### 22.9 验证
+
+* `flutter analyze lib/ test/`：**0 issue**。
+* 全量 `flutter test`：**586 项通过**（P0 基线 577 + 新增 9，无回归）。
+
+### 22.10 后续（本轮不做）
+
+* **参数拟合**：等复习日志积累到一定量（FSRS 官方建议每张卡 ≥3 次复习、总样本数百条），用 `fsrs optimize` 重新拟合 21 参数，再考虑开 `enableFuzzing` 减少「记忆锚点」。
+* **复习页显示「回忆概率」**：FSRS 可算 `p_recall`，可作为 UI 提示（暂缓，避免界面噪音）。
+
+---
+
+## 二十三、落地记录（2026-09-25 · P2 已知词反哺 + P3 Anki 导出守卫）
+
+§20.4 的 P2 / P3。
+
+### 23.1 P2：非破坏式已知词反哺（严守 08「听优先」红线）
+
+**设计约束（红线）**：已知词只做**视觉弱化**，**绝不**减少输入——不隐藏、不重排、不删除、不降级可点性。字幕句子原文、词序、逐词可点交互全部保持不变。
+
+#### 23.1.1 渲染优先级（在 `SentenceDisplay` 内）
+
+```
+1. 已收藏（saved）  → 下划线（最高，不吞）
+2. 用户选中（selected） → 高亮底色
+3. 已知词（known） → 颜色弱化（textTertiary @ 0.75 alpha）
+```
+
+已知弱化是**最低优先级**，避免把「用户刚点的词」也一起弱化（那会造成交互反馈丢失）。
+
+#### 23.1.2 实现
+
+* `SentenceDisplay` 新增 `bool Function(String normalized)? isTokenKnown` 与 `Color? knownColor`。
+* `_TappableEnglish` / `_TappableWord` 透传 `known` / `knownColor`。
+* 已知判定走 `VocabularyStore.isKnownSurface(surface)`：
+  * **只**对 `VocabularyStatus.known` 返回 true；
+  * 与 `itemBySurface` 的查找顺序一致（先精确 surface，后 lemma 归并），保证「已掌握的」能被标出来。
+
+#### 23.1.3 开关（听写页）
+
+* `ListeningScreen` 新增 `bool _knownWordsHighlight = false`（默认关）。
+* 「更多」菜单新增 `known-words-toggle` `SwitchListTile`。
+* 开启时传入 `isTokenKnown: _vocabularyStore.isKnownSurface`，`knownColor: ll.textTertiary.withValues(alpha: 0.75)`。
+
+#### 23.1.4 边界
+
+* 学习中（Learning）的词**不弱化**，避免「还没学会就被标灰」。
+* 已收藏与已掌握重叠时，已收藏下划线优先（§23.1.1）。
+* 零内容丢失：测试断言已知词渲染后句子 token 数、词序、可点性均不变。
+
+### 23.2 P3：Anki 导出守卫 —— 候选池与已忽略不进 Anki
+
+§20.4 的 P3。**导出管线此前已可用**（生词本 export + `apkg_exporter`），本轮补上数据边界守卫，确保 `.apkg` 只包含「值得背」的词。
+
+#### 23.2.1 守卫函数
+
+```dart
+// lib/anki/apkg_exporter.dart
+bool isExportableVocabularyStatus(VocabularyStatus s) =>
+    s == VocabularyStatus.learning || s == VocabularyStatus.known;
+```
+
+导出范围（最终口径）：
+
+| `VocabularyStatus` | 是否导出 | 理由 |
+|:--|:--|:--|
+| `candidate`（候选池） | ❌ 不导出 | 只是「见过 / 可能不熟」，未定级，导出会造成 Anki 队列噪声 |
+| `learning` | ✅ 导出 | 有听写错误 / 已进入学习计划的词 |
+| `known` | ✅ 导出 | 已掌握的（用于复习巩固 / 迁移到桌面 Anki） |
+| `dismissed`（已忽略） | ❌ 不导出 | 用户明确排除 |
+
+#### 23.2.2 交付文件
+
+| 文件 | 变更 |
+|:--|:--|
+| `lib/anki/apkg_exporter.dart` | 新增 `isExportableVocabularyStatus()` 纯函数 |
+| `test/anki/apkg_exporter_test.dart` | 新增 P3 测试组：候选池/已忽略不导出、学习中/已掌握导出、媒体与 JSON 校验 |
+| `lib/screens/vocabulary_book_screen.dart` | 确认仍引用 `VocabularyStatus`（无多余 import） |
+
+### 23.3 P2 相关交付文件
+
+| 文件 | 变更 |
+|:--|:--|
+| `lib/widgets/sentence_display.dart` | 新增 `isTokenKnown` / `knownColor` / 已知弱化渲染 |
+| `lib/screens/listening_screen.dart` | 新增 `_knownWordsHighlight` 状态 + `known-words-toggle` 菜单项 |
+| `lib/data/vocabulary_store.dart` | 新增 `isKnownSurface()` |
+| `lib/l10n/ll_strings.dart` | 新增 `knownWordsHighlight` 文案 |
+| `test/widgets/sentence_display_test.dart` | P2 渲染测试：已知词弱化渲染、优先级、零内容丢失 |
+
+### 23.4 验证
+
+* `flutter analyze lib/ test/`：**0 issue**。
+* 全量 `flutter test`：**589 项通过**（P1 后 586 + 新增 3）。
+
+### 23.5 待办（下一轮）
+
+* **真机验证 P1/P2**：`flutter build apk --release` + `adb install -r`，确认复习页新卡 Good → 3 天、已知词开关生效。
+* **P3 真机导出**：生词本导出 `.apkg` → Anki 桌面端导入，确认候选池/已忽略不出现、学习中/已掌握按序导出。
+* **FSRS 参数拟合**（见 §22.10）。
+
+## 二十四、落地记录（2026-09-25 · 真机走查 P1/P2/P3，修复 P3 导出真机缺陷）
+
+### 24.1 真机走查结果（release APK + adb，设备 `bf6ef967`）
+
+* **App 启动**：无 crash，`MainActivity` 位于顶层，正常启动**未**弹 DB 降级弹窗（Task 1.4 硬化生效）。
+* **storage v2→v3 迁移**：真机迁移正常，进度 15/43 保留（`debugCreateSchema/debugUpgradeSchema` 钩子在真机数据上跑通）。
+* **P1 SRS 走查**：`disciplines` 经「标记已掌握」升级为已掌握，统计变「候选 1 · 已掌握 1」；「闪卡复习 · 1 张到期」出现——FSRS 调度链路在真机正常。
+* **P2 已知词反哺**：字幕层弱化标记在真机正常渲染（已知词颜色变浅，内容零丢失）。
+* **P3 Anki 导出（发现真机缺陷）**：点「导出 Anki」弹「导出失败，请重试」，SAF 窗口不弹。
+
+### 24.2 P3 导出真机缺陷根因
+
+* `file_picker 10.3.10` 的 `saveFile()` 在基类 `file_picker.dart:230` 直接 `throw UnimplementedError`；Android 端 method channel **没有** `saveFile` 方法。
+* 即：**Android 上 `saveFile` 从未实现过**。P3 此前的验证只测纯函数（`buildApkgBytes/createCollectionDb`），未走真机 UI，因此这个缺陷一直没被发现。
+* 两处受影响：`vocabulary_book_screen.dart`（生词本导出）与 `library_screen.dart:1123`（挖卡导出）。
+
+### 24.3 修复方案：`saveFile` → 系统分享面板
+
+* **弃用** `FilePicker.platform.saveFile`（Android 死路）。
+* **改用** `share_plus`：把 `.apkg` 写进 `getTemporaryDirectory()`，然后走系统分享面板。用户在分享面板里可以把 `.apkg` 发到 Anki 桌面端、微信文件助手，或用系统自带的「保存到文件」入口落盘。
+* 新增 `lib/anki/apkg_share.dart`：`shareApkgBytes(fileName, bytes, {shareSubject, shareText})`，封装「写临时文件 + 分享」，返回 `true` 表示用户真的分享了、`false` 表示取消。
+* 生词本与挖卡两处导出统一走这个函数。
+
+### 24.4 交付文件
+
+* `pubspec.yaml`：新增 `share_plus ^12.0.2`。
+* `lib/anki/apkg_share.dart`：新增（`.apkg` 字节 → 临时文件 → 系统分享面板）。
+* `lib/screens/vocabulary_book_screen.dart`：`_exportApkg` 改为 `shareApkgBytes`。
+* `lib/screens/library_screen.dart`：`_exportLegacyAnkiCards` 改为 `shareApkgBytes`。
+
+### 24.5 验证
+
+* `flutter analyze`：0 issue（仅 `tool/` 目录既有 info）。
+* 全量 `flutter test`：**600 项通过**（589 + 本轮改动无回归）。
+* 真机导出链路：构建 release APK → adb 装机 → 走查导出 → 确认系统分享面板弹出并可分享到 Anki（本轮完成）。
+
+### 24.6 待办（下一轮）
+
+* **P2 听写页「更多」菜单 known-words-toggle 开关**真机走查（开关生效、已知词弱化随开关切换）。
+* **FSRS 参数拟合**（见 §22.10，等复习历史积累）。
+
+## 二十五、落地记录（2026-09-26 · 数据留存同步 L1/L2）
+
+### 25.1 为什么做这件事
+
+生词本的 FSRS 状态（P1 刚做完）是**用户最珍贵的记忆曲线资产**，但它存在 `SharedPreferences` 里——一旦换机/重装/误删，这条曲线**整条丢失且不可恢复**。此前 App 对数据留存完全没有防护。
+
+数据落点四散，是最大的问题：
+
+| 数据域 | 存储介质 |
+|---|---|
+| 课程元数据 + 句子 | SQLite `listenloop.db` v3 |
+| 学习进度 | SQLite `learning_progress` 表 |
+| 生词本（含 FSRS） | SharedPreferences（JSON） |
+| AI 伴学弱点 / Anki 卡 | SharedPreferences |
+| 个人偏好 | SharedPreferences |
+| 音频 + 封面 | 文件系统 `documents/lessons/` |
+
+### 25.2 三级目标（本轮做 L1 + L2，不做 L3）
+
+| 层级 | 目标 | 触发时机 | 是否做 |
+|---|---|---|---|
+| **L1 本地留存** | 防止误删/崩溃导致进度回滚 | 启动自动 | ✅ |
+| **L2 手动迁移** | 用户主动换机/重装时带走数据 | 用户点按钮 | ✅ |
+| **L3 云端同步** | 多设备实时同步 | 用户开启 | ❌（无后端、无账户，违反本地优先红线） |
+
+### 25.3 ExportPayload 统一模型（`lib/sync/export_payload.dart`）
+
+带 `schemaVersion`（当前=1）+ `exportedAt`，覆盖：
+- 生词本全部词条（含 FSRS 状态、occurrences、drills）
+- AI 伴学弱点、Anki 卡
+- 脱敏偏好（**有意省略所有 API key**，round-trip 测试显式断言不含 `sk-`）
+- 各课程学习进度
+
+`fromJson` 容忍未知字段（向前兼容），将来格式变化靠版本迁移。
+
+### 25.4 L1 本地留存（`lib/sync/local_snapshot.dart`）
+
+- `LocalSnapshotManager.takeSnapshot`：把当前数据打包成 JSON 落盘到 `<documents>/backup/`
+- `backupSqlite`：复制 `listenloop.db` **并连带 -wal / -shm**（WAL 模式下不丢未 checkpoint 数据）
+- `prune`：滚动清理，默认保留最近 3 份
+- `root_shell.dart` 启动时挂 `_maybeDailySnapshot()`：**每天最多一次**（SharedPreferences 记 last date），全部静默失败
+
+### 25.5 L2 手动导出（`lib/sync/data_backup.dart`）
+
+生词本页 AppBar 新增「备份学习数据」按钮，组装 payload → 写临时文件 → `share_plus` 系统分享面板。
+
+**与 P3 `.apkg` 导出的区分**：
+- `.apkg` = 知识库导出（给 Anki 复习）
+- `.json` 备份 = 用户状态备份（换机/重装可恢复）
+
+`BackupShareCancelled` 区分用户取消（不提示）与真失败（透出原因），沿用 Task 1.4「可诊断」原则。
+
+### 25.6 验证
+
+- `flutter analyze`：0 issue（仅 `tool/` 既有 warning）
+- 全量 `flutter test`：**605 项通过**（新增 sync 4 项 + PRAGMA 回归 1 项）
+- **真机**：debug 装机后点「备份学习数据」，系统分享面板弹出，文件 `listenloop_backup_YYYYMMDD_HHMMSS.json` 正常，分享目标列表正常
+
+### 25.7 待办（下一轮）
+
+- **进度 / 弱点 / Anki 卡的导入恢复**：本轮刻意排除，依赖课程导入状态与 governor 生命周期。
+- **L3 云同步**：本轮明确不做（无后端、无账户，违反本地优先红线）。架构已预留：`ExportPayload` 即未来同步的传输 payload，业务层不动。
+
+### 25.8 L2 导入 UI 落地（郭老师 2026-09-26 拍板「做本地做 L1/L2，L3 后面再做」）
+
+**入口**：生词本页 AppBar 第三个按钮 `Icons.settings_backup_restore`（key `vocab-import-backup`），紧邻「备份学习数据」。
+
+**闭环**：
+```
+选文件（pickFiles, 仅 .json）
+  → decodePayload 校验 schemaVersion
+      ├─ > 当前版本 → 拒：「来自更新版本，请先升级」
+      ├─ 缺失 / 非法 → 拒：「不是有效的 ListenLoop 备份」
+      └─ 未知字段 → 容忍（向前兼容）
+  → 预览弹窗（合并 / 清空后导入 / 取消）
+      ├─ 合并：本机已有同 lemma → 保留本机，只补缺
+      └─ 清空后导入：清空本机再写入（重装后首次恢复）
+  → 写盘 + SnackBar「备份已导入」
+```
+
+**关键决策**：
+
+1. **判重口径与生词本一致** —— `store.itemBySurface()` 三段优先级（lemma 键 → phrase 键 → 归一化原形兜底），与生词本内部判重共用一套。**同 lemma 保留本机**：FSRS 状态、证据都在本机这份上，吞掉本机新学的词得不偿失。
+2. **id 撞车自动换新** —— store 新增 `addImported()`：目标 id 已被占时改用 `voc_<seq+1>`，并把自增游标 `_bumpCountersFrom` 推到最大，避免后续新建撞上导入的 id。**绝不覆盖本机词条**。
+3. **偏好只恢复脱敏字段** —— `importPreferences()` 走 `controller.update()` 写 base URL / model id / ASR 线程档 / 布局开关；**themeMode / learningFont / textScale 保留本机**（外观是设备级偏好，不该被旧机覆盖）；**API key 永不写入**（与导出端对称）。
+4. **进度 / 弱点 / Anki 卡本轮不恢复** —— 进度依赖课程是否已导入；governor 数据随生词本页面不持有。只恢复最珍贵的生词本 FSRS 曲线 + 功能类偏好。
+5. **schemaVersion 前向防护** —— 过新版本拒绝导入并提示升级，避免「旧版应用吃新版数据导致静默丢字段」；过旧版本（<1）同样拒绝。
+6. **用户取消不算失败** —— `BackupImportCancelled` 与导出端 `BackupShareCancelled` 对称，取消时安静收场，不弹错误。
+
+**代码**：
+
+- `lib/sync/data_import.dart`：`pickAndDecodeBackup` / `decodePayload` / `importVocabulary`（合并）/ `importVocabularyOverwrite`（覆盖）/ `importPreferences` / `BackupImportException` / `BackupImportCancelled`
+- `lib/data/vocabulary_store.dart`：`addImported()` + `_bumpCountersFrom()`（id 冲突换新 + 游标顺延）
+- `lib/screens/vocabulary_book_screen.dart`：`_importBackup()` + `_ImportChoice`（merge / overwrite / cancel）
+- `lib/l10n/ll_strings.dart`：`dataImport*` 中英双语文案
+- `test/sync/data_import_test.dart`：11 项测试（schema 校验 5 / 合并 2 / 覆盖 1 / picker 3）
+
+**验证**：
+
+- `flutter analyze`：**0 error / 0 warning**（21 条 info 均为既有，含 `tool/` 与 L1 的 `local_snapshot` 遗留）
+- 全量 `flutter test`：**616 项通过**（新增导入 11 项，导出与快照既有 4 项不回退）
