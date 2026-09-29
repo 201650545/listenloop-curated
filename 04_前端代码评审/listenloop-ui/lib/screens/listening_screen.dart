@@ -1,0 +1,1930 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+
+import '../data/ai_governor_service.dart';
+import '../data/demo_sentences_human.dart';
+import '../l10n/ll_strings.dart';
+import '../models/lesson.dart';
+import '../models/sentence.dart';
+import '../models/video_source.dart';
+import '../player/audio_player_facade.dart';
+import '../player/just_audio_facade.dart';
+import '../player/playback_mode.dart';
+import '../player/sentence_player_controller.dart';
+import '../player/video_playback_facade.dart';
+import '../preferences/app_preferences.dart';
+import '../storage/lesson_repository.dart';
+import '../theme/listenloop_theme.dart';
+import '../widgets/ai_tutor_sheet.dart';
+import '../widgets/anki/anki_review_dialog.dart';
+import '../widgets/listening_top_bar.dart';
+import '../widgets/media_area.dart';
+import '../widgets/playback_controls.dart';
+import '../widgets/sentence_display.dart';
+import '../widgets/sentence_page_list.dart';
+import '../widgets/speed_selector.dart';
+import '../widgets/subtitle_mode_selector.dart';
+import '../widgets/video_area.dart';
+import 'dictation_screen.dart';
+import '../data/vocabulary_store.dart';
+import '../models/subtitle_token.dart';
+import '../models/vocabulary_model.dart';
+
+/// The listening screen (Visual Polish V1/V2).
+///
+/// Black/white minimal, one-sentence focus: the English sentence is the
+/// first visual focus, the Chinese translation is a second layer, and the
+/// control cluster sits in the lower half for one-hand use. Learning
+/// typography follows the user preferences (font + text scale, spec V2
+/// §二十七–二十九). Playback behaviour is owned by
+/// [SentencePlayerController] — this widget only renders state and
+/// forwards intent (spec V0.1 §28).
+class ListeningScreen extends StatefulWidget {
+  const ListeningScreen({
+    super.key,
+    this.audioFacade,
+    this.videoFacade,
+    this.sentences,
+    this.audioAsset,
+    this.title,
+    this.language,
+    this.audioIsFile = false,
+    this.lessonId,
+    this.repository,
+    this.coverPath,
+    this.initialSentenceIndex = 0,
+    this.autoPlay = false,
+    this.initialRepeatTarget = 1,
+    this.initialPlaybackRate = 1.0,
+    this.initialSubtitleMode,
+    this.initialPageMode = false,
+    this.videoSource,
+    this.onControllerCreated,
+    this.aiGovernorService,
+    this.vocabularyStore,
+  });
+
+  /// Optional AI Governor service (injected by caller or tests).
+  final AiGovernorService? aiGovernorService;
+
+  /// Optional vocabulary store (injected by caller or tests).
+  ///
+  /// 生词本两层模型（Item / Occurrence）。见 10 号设计文档 §十三。
+  final VocabularyStore? vocabularyStore;
+
+  /// Overrides the production [JustAudioFacade] (used by tests).
+  final AudioPlayerFacade? audioFacade;
+
+  /// Overrides the production [VideoPlaybackFacade] for lessons with a video
+  /// source (used by tests; Phase 3C). Without it, a [VideoSource] lesson
+  /// gets a real [VideoPlaybackFacade] and audio-only lessons get none.
+  final AudioPlayerFacade? videoFacade;
+
+  /// Overrides the bundled demo sentences (used by tests).
+  final List<Sentence>? sentences;
+
+  /// Overrides the bundled asset path (used by tests).
+  final String? audioAsset;
+
+  /// App bar title; defaults to `ListenLoop` (the bundled demo).
+  final String? title;
+
+  /// Source language of the lesson (e.g. 'en', 'ja', 'fr').
+  final String? language;
+
+  /// When true, [audioAsset] is an absolute file path instead of a bundled
+  /// asset (imported lesson media).
+  final bool audioIsFile;
+
+  /// Lesson id for progress persistence; requires [repository].
+  final String? lessonId;
+
+  /// Repository used to persist progress on dispose.
+  final LessonRepository? repository;
+
+  /// Optional lesson cover shown in the media area.
+  final String? coverPath;
+
+  /// Sentence to open (V0.2.1 恢复学习); restore uses startMs, not positionMs.
+  final int initialSentenceIndex;
+
+  /// Auto-play on open (V0.2.1 §7).
+  final bool autoPlay;
+
+  /// Restored repeat target (0 = infinite).
+  final int initialRepeatTarget;
+
+  /// Restored playback rate.
+  final double initialPlaybackRate;
+
+  /// Restored subtitle mode name ('hidden'/'english'/'bilingual').
+  final String? initialSubtitleMode;
+
+  /// Restored display mode: true = 单页文本, false = 流体文本.
+  final bool initialPageMode;
+
+  /// When set, playback is driven by the embedded web video player (Phase 3B)
+  /// instead of the local audio file, and the media slot renders the video.
+  final VideoSource? videoSource;
+
+  /// Visual Polish V2 §三十二: lets the navigation shell reach the active
+  /// controller (to pause when the user opens Settings) without exposing
+  /// the player architecture.
+  final ValueChanged<SentencePlayerController>? onControllerCreated;
+
+  @override
+  State<ListeningScreen> createState() => ListeningScreenState();
+}
+
+/// Public so the navigation shell can hold a [GlobalKey] to it and ask the
+/// transcript to reveal the current sentence when the Listen tab becomes
+/// visible (spec V2 §三十一 — the session persists across tab switches, so
+/// the one-shot auto-scroll guard must be reset on reveal).
+class ListeningScreenState extends State<ListeningScreen>
+    with WidgetsBindingObserver {
+  late final SentencePlayerController _controller;
+  late SubtitleMode _subtitleMode;
+  bool _pageMode = false;
+  late final List<GlobalKey> _itemKeys;
+
+  /// Bumped to ask SentencePageList to re-align to the current sentence
+  /// (tab re-entry via revealCurrentSentence, presentation-mode switch).
+  int _revealToken = 0;
+
+  // ---- 句跳滑栏（2026-09-21 用户需求）：长按字幕区呼出，拖动预览、
+  // ---- 松手跳转，适合千句级课程快速定位。
+  bool _scrubberVisible = false;
+  bool _scrubbing = false;
+  int _scrubIndex = 0;
+  double _subtitleAreaHeight = 0;
+  Timer? _scrubberHideTimer;
+  Timer? _leftLongPressTimer;
+  Offset? _leftPointerDownPos;
+  int _transcriptVisibleIndex = 0;
+  late final AiGovernorService _aiGovernorService =
+      widget.aiGovernorService ?? AiGovernorService();
+
+  /// 生词本：核心是「听」，所以积累模式默认关闭，入口在二级菜单里的三级开关。
+  late final VocabularyStore _vocabularyStore =
+      widget.vocabularyStore ?? VocabularyStore();
+
+  /// 生词积累模式是否开启（三级开关）。
+  bool _accumulationMode = false;
+
+  /// **P2 非破坏式已知词反哺开关**（默认关，08 号红线）。
+  ///
+  /// 开启后字幕里「已掌握」的词做视觉弱化（只改颜色），**不隐藏、
+  /// 不重排、不减少内容**。关掉时完全不参与渲染（`isTokenKnown` 传 null）。
+  bool _knownWordsHighlight = false;
+
+  /// 点词保存 / 再点取消 —— 返回 true 表示当前为「已保存」。
+  ///
+  /// 判重交给 VocabularyStore：Item 层按归一化词形跨课程合并，
+  /// Occurrence 层按 (lesson, sentence, 字符区间) 判重，
+  /// 所以同一句里的多个词**不会互相覆盖**（现状 AnkiCard 按句判重会覆盖）。
+  bool _toggleVocabulary({
+    required String surface,
+    required VocabularyKind kind,
+    required int charStart,
+    required int charEnd,
+  }) {
+    final sentence = _controller.currentSentence;
+    return _vocabularyStore.toggleOccurrence(
+      surface: surface,
+      kind: kind,
+      lessonId: widget.lessonId ?? 'demo',
+      lessonTitle: widget.title ?? '精听课程',
+      sentenceId: sentence.id,
+      sentenceIndex: sentence.index,
+      sentenceText: sentence.english,
+      startMs: sentence.startMs,
+      endMs: sentence.endMs,
+      audioPath: widget.audioAsset ?? '',
+      charStart: charStart,
+      charEnd: charEnd,
+    );
+  }
+
+  bool _toggleWord(SubtitleToken token) => _toggleVocabulary(
+    surface: token.surface,
+    kind: VocabularyKind.word,
+    charStart: token.charStart,
+    charEnd: token.charEnd,
+  );
+
+  /// 长按拖动圈出的短语（只圈到一个词时按单词处理）。
+  ///
+  /// 与点词走**同一条存储路径**：判重键是字符区间，所以「先点了 take、
+  /// 后来圈出 take off」会得到两条互不覆盖的证据（kind 分别是 word / phrase）。
+  void _onPhraseSelected(SubtitleSelection selection) {
+    final saved = _toggleVocabulary(
+      surface: selection.text,
+      kind: selection.isPhrase ? VocabularyKind.phrase : VocabularyKind.word,
+      charStart: selection.charStart,
+      charEnd: selection.charEnd,
+    );
+    setState(() {});
+    _showVocabFeedback(
+      surface: selection.text,
+      kind: selection.isPhrase ? VocabularyKind.phrase : VocabularyKind.word,
+      charStart: selection.charStart,
+      charEnd: selection.charEnd,
+      saved: saved,
+    );
+  }
+
+  /// 点词 / 圈短语之后的统一反馈。
+  ///
+  /// **只给轻提示与撤销，不弹释义、不暂停音频** ——「存」与「查」必须分开，
+  /// 立刻弹释义会把注意力从声音时间轴拉走（见 10 号文档 §四）。
+  ///
+  /// 区间由调用方显式传入（不用"最近一次"之类的隐式状态），
+  /// 这样撤销回滚的一定是刚存的那一处证据。
+  void _showVocabFeedback({
+    required String surface,
+    required VocabularyKind kind,
+    required int charStart,
+    required int charEnd,
+    required bool saved,
+  }) {
+    final s = LLStrings.of(context);
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    if (messenger == null) return;
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        duration: const Duration(milliseconds: 1500),
+        content: Text(
+          '${saved ? '✓ ${s.vocabSaved}' : '↩ ${s.vocabRemoved}'}  $surface',
+        ),
+        action: SnackBarAction(
+          label: s.cancel,
+          onPressed: () {
+            _toggleVocabulary(
+              surface: surface,
+              kind: kind,
+              charStart: charStart,
+              charEnd: charEnd,
+            );
+            setState(() {});
+          },
+        ),
+      ),
+    );
+  }
+
+  /// 点词后的反馈：**只给轻提示与撤销，不弹释义、不暂停音频**。
+  ///
+  /// 「存」与「查」必须分开：立刻弹释义会把注意力从声音时间轴拉走，
+  /// 等于把主任务从「听」切成「读」（见 10 号文档 §四）。
+  void _onTokenTap(SubtitleToken token) {
+    final saved = _toggleWord(token);
+    setState(() {});
+    _showVocabFeedback(
+      surface: token.surface,
+      kind: VocabularyKind.word,
+      charStart: token.charStart,
+      charEnd: token.charEnd,
+      saved: saved,
+    );
+  }
+
+  /// 二级菜单（精听页 ⋯）—— 三级开关都收在这里。
+  Future<void> _openMoreMenu() async {
+    final s = LLStrings.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: context.ll.bg,
+      builder: (sheetContext) {
+        final ll = sheetContext.ll;
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  s.more,
+                  style: TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.w600,
+                    color: ll.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                SwitchListTile(
+                  key: const Key('accumulation-toggle'),
+                  contentPadding: EdgeInsets.zero,
+                  value: _accumulationMode,
+                  activeThumbColor: ll.textPrimary,
+                  onChanged: (value) {
+                    Navigator.of(sheetContext).pop();
+                    setState(() => _accumulationMode = value);
+                  },
+                  title: Text(
+                    s.vocabAccumulation,
+                    style: TextStyle(fontSize: 14, color: ll.textPrimary),
+                  ),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        s.vocabAccumulationHint,
+                        style: TextStyle(fontSize: 11.5, color: ll.textTertiary),
+                      ),
+                      const SizedBox(height: 2),
+                      // 长按拖动是隐藏手势 —— 不写出来没人会试
+                      Text(
+                        s.vocabPhraseHint,
+                        style: TextStyle(fontSize: 11, color: ll.textTertiary),
+                      ),
+                    ],
+                  ),
+                ),
+                Divider(color: ll.divider, height: 24),
+                // P2 非破坏式已知词反哺（08 号红线）：只弱化视觉，不删内容。
+                SwitchListTile(
+                  key: const Key('known-words-toggle'),
+                  contentPadding: EdgeInsets.zero,
+                  value: _knownWordsHighlight,
+                  activeThumbColor: ll.textPrimary,
+                  onChanged: (value) {
+                    Navigator.of(sheetContext).pop();
+                    setState(() => _knownWordsHighlight = value);
+                  },
+                  title: Text(
+                    s.vocabKnownWordsHighlight,
+                    style: TextStyle(fontSize: 14, color: ll.textPrimary),
+                  ),
+                  subtitle: Text(
+                    s.vocabKnownWordsHighlightHint,
+                    style: TextStyle(fontSize: 11.5, color: ll.textTertiary),
+                  ),
+                ),
+                Divider(color: ll.divider, height: 24),
+                Text(
+                  s.vocabCandidateCount(_vocabularyStore.itemCount),
+                  style: TextStyle(fontSize: 11.5, color: ll.textTertiary),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 核心层 P1：打开听写训练（句级录入 / 段级集中批改）。
+  ///
+  /// 复用同一个播放控制器 —— 用户听到的必须是原片句轴音频，
+  /// 不允许用合成音替代（见 08 定调的交互红线）。
+  void _openDictation() async {
+    _controller.pause();
+    final result = await Navigator.of(context).push<int>(
+      MaterialPageRoute<int>(
+        builder: (_) => DictationScreen(
+          controller: _controller,
+          // 听写完成流入口：把 AI governor 传下去，批改出的错句可一键
+          // 接进「意思回忆」的在线 AI 反馈（未注入时走静态自比兜底）。
+          governor: _aiGovernorService,
+        ),
+      ),
+    );
+    // ListenRetryTarget 回传：听写页「回原声重听」带句子下标返回，
+    // 精听页定位到该句并播放（v0.9.1，17 号路线图双出口之一）。
+    if (result != null && result >= 0 && mounted) {
+      await _controller.selectSentence(result);
+      if (mounted) unawaited(_controller.playCurrentSentence());
+    }
+  }
+
+  void _openAiTutor() {
+    _controller.pause();
+    final lesson = Lesson(
+      id: widget.lessonId ?? 'demo',
+      title: widget.title ?? '精听课程',
+      language: widget.language ?? 'en',
+      audioPath: widget.audioAsset ?? '',
+      sentenceCount: _controller.sentenceCount,
+      durationMs: _controller.sentences.isNotEmpty
+          ? _controller.sentences.last.endMs
+          : 0,
+      importedAt: DateTime.now(),
+    );
+    AiTutorSheet.show(
+      context: context,
+      lesson: lesson,
+      currentSentenceIndex: _controller.currentSentenceIndex,
+      sentences: _controller.sentences,
+      aiGovernorService: _aiGovernorService,
+      onSeekToSentence: (index) {
+        _controller.selectSentence(index);
+        _controller.playCurrentSentence();
+      },
+    );
+  }
+
+  Future<void> _toggleAnkiCard() async {
+    final curIdx = _controller.currentSentenceIndex;
+    if (curIdx < 0 || curIdx >= _controller.sentences.length) return;
+    final sentence = _controller.sentences[curIdx];
+    final lessonId = widget.lessonId ?? 'demo';
+
+    final isAdded = _aiGovernorService.isSentenceInAnki(lessonId, curIdx);
+    if (isAdded) {
+      final card = _aiGovernorService.getCardForSentence(lessonId, curIdx);
+      if (card != null && mounted) {
+        AnkiReviewDialog.show(
+          context: context,
+          cards: [card],
+          aiGovernorService: _aiGovernorService,
+          onPlaySnippet: (start, end) {
+            _controller.selectSentence(curIdx);
+            _controller.playCurrentSentence();
+          },
+        );
+      }
+    } else {
+      final lesson = Lesson(
+        id: lessonId,
+        title: widget.title ?? '精听课程',
+        language: widget.language ?? 'en',
+        audioPath: widget.audioAsset ?? '',
+        sentenceCount: _controller.sentenceCount,
+        durationMs: _controller.sentences.isNotEmpty
+            ? _controller.sentences.last.endMs
+            : 0,
+        importedAt: DateTime.now(),
+      );
+      await _aiGovernorService.createAnkiCardFromSentence(
+        lesson: lesson,
+        sentence: sentence,
+      );
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('✨ 已加入 Anki 智能闪卡库 (SM-2 艾宾浩斯复习已排期)'),
+            duration: Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      }
+    }
+  }
+
+  /// The video-side facade when the lesson carries a video (Phase 3C); the
+  /// controller owns and disposes it. Only a production [VideoPlaybackFacade]
+  /// can render [VideoArea]; a test-injected fake falls back to the cover.
+  AudioPlayerFacade? _videoFacade;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    // Phase 3C §2: every lesson enters in audio mode, even when it carries
+    // a video. The video facade is constructed up front (cheap — it only
+    // configures a WebView) but its page is loaded lazily on the first
+    // switch to video mode, inside the controller's setPlaybackMode.
+    _videoFacade =
+        widget.videoFacade ??
+        (widget.videoSource != null
+            ? VideoPlaybackFacade(source: widget.videoSource!)
+            : null);
+    _controller = SentencePlayerController(
+      audioFacade: widget.audioFacade ?? JustAudioFacade(),
+      videoFacade: _videoFacade,
+      sentences: widget.sentences ?? demoSentencesHuman,
+      audioAsset: widget.audioAsset ?? demoAudioAssetHuman,
+      audioIsFile: widget.audioIsFile,
+      initialSentenceIndex: widget.initialSentenceIndex,
+      initialPlaybackRate: widget.initialPlaybackRate,
+      initialRepeatTarget: widget.initialRepeatTarget,
+    );
+    _subtitleMode = SubtitleMode.values.firstWhere(
+      (m) => m.name == widget.initialSubtitleMode,
+      orElse: () => SubtitleMode.bilingual,
+    );
+    _pageMode = widget.initialPageMode;
+    _itemKeys = List.generate(_controller.sentenceCount, (_) => GlobalKey());
+    _lastSentenceIndex = widget.initialSentenceIndex;
+    // 自动点词的存档跨启动存活：只有自建（无人注入共享实例）时才需要装载，
+    // 共享实例由上层（RootShell）负责装载，避免重复读盘。
+    if (widget.vocabularyStore == null) {
+      unawaited(_vocabularyStore.load());
+    }
+    _controller.addListener(_onControllerChanged);
+    // V2 §三十二: the shell can reach the active controller (pause when the
+    // user opens Settings) without exposing the playback architecture.
+    widget.onControllerCreated?.call(_controller);
+    // Kick off async initialisation; UI reacts via notifyListeners.
+    _controller.initialize().then((_) {
+      if (!widget.autoPlay || !mounted) return;
+      if (_controller.hasError) return;
+      _controller.playCurrentSentence();
+    });
+  }
+
+  /// AI 伴学的在线通道（网关地址 / 密钥 / 模型）由 PreferencesScope 持有，
+  /// 每次从设置页返回都要同步一次，否则讨论页仍在打旧模型。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final prefs = PreferencesScope.maybeOf(context);
+    if (!identical(prefs, _aiGovernorService.appPreferences)) {
+      _aiGovernorService.updatePreferences(prefs);
+    }
+  }
+
+  /// V2 §三十一: the listening session lives inside the navigation shell and
+  /// may never be disposed for the whole app session, so progress is also
+  /// checkpointed when the app leaves the foreground — same save routine as
+  /// dispose, zero algorithm change.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused) _saveProgressIfPossible();
+  }
+
+  int _sentenceDirection = 1;
+  int _lastSentenceIndex = 0;
+
+  void _onControllerChanged() {
+    if (mounted) {
+      final curIdx = _controller.currentSentenceIndex;
+      if (curIdx != _lastSentenceIndex) {
+        _sentenceDirection = curIdx > _lastSentenceIndex ? 1 : -1;
+        _lastSentenceIndex = curIdx;
+      }
+      setState(() {});
+    }
+  }
+
+  @override
+  void dispose() {
+    if (widget.vocabularyStore == null) _vocabularyStore.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    _leftLongPressTimer?.cancel();
+    _scrubberHideTimer?.cancel();
+    _controller.removeListener(_onControllerChanged);
+    _saveProgressIfPossible();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  // ------------------------------------------------ 句跳滑栏手势处理 ----
+
+  /// 把字幕区内的纵向位置映射为句索引：顶部 = 第 1 句，底部 = 最后一句。
+  /// 2026-09-22 优化：精准基于轨道有效范围 (top: 14%, height: 72%) 映射，
+  /// 确保手指在轨道顶部精准定位到第 1 句，轨道底部精准定位到末句。
+  int _scrubIndexFromLocalY(double dy) {
+    final count = _controller.sentenceCount;
+    if (count <= 1 || _subtitleAreaHeight <= 0) return 0;
+    final topOffset = _subtitleAreaHeight * 0.14;
+    final trackHeight = _subtitleAreaHeight * 0.72;
+    if (trackHeight <= 0) return 0;
+    final t = ((dy - topOffset) / trackHeight).clamp(0.0, 1.0);
+    return (t * (count - 1)).round().clamp(0, count - 1);
+  }
+
+  /// 滑栏逐档触感反馈（可在设置中关闭：scrubberHaptics）。
+  void _scrubHaptic() {
+    if (!PreferencesScope.maybeOf(context).scrubberHaptics) return;
+    unawaited(HapticFeedback.selectionClick());
+  }
+
+  void _startScrubbing(double dy) {
+    _scrubberHideTimer?.cancel();
+    _subtitleAreaHeight = _subtitleAreaHeight <= 0 ? 1 : _subtitleAreaHeight;
+    setState(() {
+      _scrubberVisible = true;
+      _scrubbing = true;
+      _scrubIndex = _scrubIndexFromLocalY(dy);
+    });
+    if (PreferencesScope.maybeOf(context).scrubberHaptics) {
+      unawaited(HapticFeedback.mediumImpact());
+    }
+  }
+
+  void _updateScrubbing(double dy) {
+    final index = _scrubIndexFromLocalY(dy);
+    if (index == _scrubIndex) return;
+    setState(() => _scrubIndex = index);
+    _scrubHaptic();
+  }
+
+  void _endScrubbing() {
+    if (!_scrubbing) return;
+    final target = _scrubIndex;
+    setState(() => _scrubbing = false);
+    if (target != _controller.currentSentenceIndex) {
+      _controller.selectSentence(target);
+    }
+    _scheduleScrubberHide();
+  }
+
+  void _onScrubStart(LongPressStartDetails details) {
+    _startScrubbing(details.localPosition.dy);
+  }
+
+  void _onScrubUpdate(LongPressMoveUpdateDetails details) {
+    _updateScrubbing(details.localPosition.dy);
+  }
+
+  void _onScrubEnd(LongPressEndDetails details) {
+    _endScrubbing();
+  }
+
+  void _scheduleScrubberHide() {
+    _scrubberHideTimer?.cancel();
+    _scrubberHideTimer = Timer(const Duration(milliseconds: 3000), () {
+      if (mounted && !_scrubbing) {
+        setState(() => _scrubberVisible = false);
+      }
+    });
+  }
+
+
+  /// V2 §三十一: the transcript may have been laid out offstage while the
+  /// user was on another tab. Bump the reveal token so SentencePageList
+  /// re-aligns to the currently playing sentence on its next build.
+  void revealCurrentSentence() {
+    if (!mounted) return;
+    setState(() => _revealToken++);
+  }
+
+  /// 附属层「回原声」入口：跳到指定句（生词本证据里的句子）。
+  ///
+  /// 播的必须是**原片句轴音频**（08 定调红线：不得用合成音替代）。
+  /// 越界或尚未初始化时静默忽略 —— 附属功能失败不得阻塞核心。
+  void jumpToSentence(int index, {bool autoplay = true}) {
+    if (!mounted || !_controller.isInitialized) return;
+    if (index < 0 || index >= _controller.sentenceCount) return;
+    unawaited(_controller.selectSentence(index));
+    if (autoplay) unawaited(_controller.playCurrentSentence());
+    setState(() => _revealToken++);
+  }
+
+  /// Persists where the user left off (spec V0.2 §20) before teardown.
+  /// Fire-and-forget: a failed save must never block closing the screen.
+  void _saveProgressIfPossible() {
+    final lessonId = widget.lessonId;
+    final repository = widget.repository;
+    if (lessonId == null || repository == null) return;
+    if (!_controller.isInitialized || _controller.hasError) return;
+    final index = _controller.currentSentenceIndex;
+    final positionMs = _controller.currentPosition.inMilliseconds;
+    unawaited(
+      repository
+          .saveProgress(
+            lessonId: lessonId,
+            lastSentenceIndex: index,
+            positionMs: positionMs,
+            repeatTarget: _controller.repeatTarget,
+            playbackRate: _controller.playbackRate,
+            subtitleMode: _subtitleMode.name,
+            displayMode: _pageMode ? 'page' : 'fluid',
+          )
+          .catchError((Object e) {
+            debugPrint('[ListenLoop] failed to save progress: $e');
+          }),
+    );
+  }
+
+  void _onPlayPause() {
+    if (_controller.isPlaying) {
+      _controller.pause();
+      // The session may stay mounted inside the shell for a long time —
+      // checkpoint on pause as well as on lifecycle changes.
+      _saveProgressIfPossible();
+    } else {
+      _controller.playCurrentSentence();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = _controller;
+    final ll = context.ll;
+    final prefs = PreferencesScope.maybeOf(context);
+    final learning = LLReadLearningStyles(
+      english: LLLearning.englishSentence(ll, prefs),
+      chinese: LLLearning.chineseSentence(ll, prefs),
+    );
+    final loading = !controller.isInitialized && !controller.hasError;
+
+    // （原外层 ensureVisible 跟随路径已移除：懒加载 ListView 下目标行
+    // 未挂载时静默失效，且与 SentencePageList 内部定位互相打架。
+    // 定位统一由 SentencePageList._alignToIndex 承担。）
+
+    final sentenceChild = AnimatedSwitcher(
+      // §三十五 follow-up: fluid ⇄ transcript also crossfades — switching
+      // presentation feels like a fade, not a page jump.
+      duration: LLMotion.normal,
+      switchInCurve: LLMotion.curve,
+      child: KeyedSubtree(
+        key: ValueKey(_pageMode),
+        child: _pageMode
+            ? LayoutBuilder(
+                builder: (context, constraints) {
+                  _subtitleAreaHeight = constraints.maxHeight;
+                  // 长按句跳滑栏（用户需求 2026-09-21）：与 Fluid 模式同款，
+                  // 挂在整页字幕区，长按呼出、拖动预览、松手跳句。
+                  final content = Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onLongPressStart: _onScrubStart,
+                      onLongPressMoveUpdate: _onScrubUpdate,
+                      onLongPressEnd: _onScrubEnd,
+                      child: SentencePageList(
+                        sentences: controller.sentences,
+                        currentIndex: controller.currentSentenceIndex,
+                        showEnglish: _subtitleMode.showsEnglish,
+                        showChinese: _subtitleMode.showsChinese,
+                        onSentenceTap: (index) =>
+                            index == _controller.currentSentenceIndex
+                            ? _controller.replaySentence()
+                            : _controller.selectSentence(index),
+                        itemKeys: _itemKeys,
+                        preferences: prefs,
+                        header: _transcriptHeader(context, controller),
+                        revealToken: _revealToken,
+                        onVisibleIndexChanged: (idx) =>
+                            _transcriptVisibleIndex = idx,
+                      ),
+                    ),
+                  );
+                  return Stack(
+                    children: [
+                      Positioned.fill(child: content),
+                      if (_scrubberVisible || _scrubbing)
+                        Positioned(
+                          left: 0,
+                          top: 0,
+                          bottom: 0,
+                          child: _SentenceScrubber(
+                            sentenceCount: _controller.sentenceCount,
+                            currentIndex: _controller.currentSentenceIndex,
+                            scrubIndex: _scrubbing
+                                ? _scrubIndex
+                                : _controller.currentSentenceIndex,
+                            active: _scrubbing,
+                            height: constraints.maxHeight,
+                            previewSentence: _scrubbing
+                                ? _controller.sentences[_scrubIndex]
+                                : null,
+                            onDragStart: _startScrubbing,
+                            onDragUpdate: _updateScrubbing,
+                            onDragEnd: _endScrubbing,
+                          ),
+                        ),
+                    ],
+                  );
+                },
+              )
+            // Fluid mode (user request 2026-09-17): sentence changes JUMP.
+            // The old fade + horizontal drift made a long→short switch look
+            // like the previous sentence was still leaving, because both
+            // were on screen at once — the "残影" the user reported.
+            //
+            // The switch is now a plain content swap, and the sentence gets a
+            // fixed footprint (one card per sentence) so a long line cannot
+            // grow the area and a short line cannot collapse it: switching
+            // only repaints, it never re-lays-out. A long sentence scrolls
+            // inside its own card instead of pushing the layout around.
+            : LayoutBuilder(
+                builder: (context, constraints) {
+                  _subtitleAreaHeight = constraints.maxHeight;
+                  final content = Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 28),
+                    child: GestureDetector(
+                      key: const Key('subtitle-tap'),
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => _controller.replaySentence(),
+                      child: SingleChildScrollView(
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          minHeight: constraints.maxHeight,
+                        ),
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 300),
+                          switchInCurve: Curves.easeOutCubic,
+                          switchOutCurve: Curves.easeInCubic,
+                          layoutBuilder: (currentChild, previousChildren) {
+                            return Stack(
+                              alignment: Alignment.center,
+                              children: [
+                                ...previousChildren,
+                                ?currentChild,
+                              ],
+                            );
+                          },
+                          transitionBuilder: (child, animation) {
+                            final isIncoming =
+                                (child.key as ValueKey<int>?)?.value ==
+                                    controller.currentSentenceIndex;
+                            final curved = CurvedAnimation(
+                              parent: animation,
+                              curve: isIncoming
+                                  ? Curves.easeOutCubic
+                                  : Curves.easeInCubic,
+                            );
+                            final offsetTween = isIncoming
+                                ? Tween<Offset>(
+                                    begin: Offset(0, _sentenceDirection * 0.35),
+                                    end: Offset.zero,
+                                  )
+                                : Tween<Offset>(
+                                    begin: Offset(0, -_sentenceDirection * 0.35),
+                                    end: Offset.zero,
+                                  );
+                            return SlideTransition(
+                              position: offsetTween.animate(curved),
+                              child: FadeTransition(
+                                opacity: curved,
+                                child: child,
+                              ),
+                            );
+                          },
+                          child: Center(
+                            key: ValueKey(controller.currentSentenceIndex),
+                            child: SentenceDisplay(
+                              sentence: controller.currentSentence,
+                              currentPosition: controller.currentPosition,
+                              showEnglish: _subtitleMode.showsEnglish,
+                              showChinese: _subtitleMode.showsChinese,
+                              styles: learning,
+                              // 只在一级精听页、且用户主动开启积累模式后
+                              // 字幕才变成可点 —— 平时不允许把词变成按钮。
+                              accumulationMode: _accumulationMode,
+                              onTokenTap: _onTokenTap,
+                              onPhraseSelected: _onPhraseSelected,
+                              isTokenSaved: (start, end) =>
+                                  _vocabularyStore.isSaved(
+                                    lessonId: widget.lessonId ?? 'demo',
+                                    sentenceId: controller.currentSentence.id,
+                                    charStart: start,
+                                    charEnd: end,
+                                  ),
+                              // P2 非破坏式已知词反哺：已掌握词做视觉弱化，
+                              // 只改颜色、不隐藏不重排不删内容（08 号红线）。
+                              isTokenKnown: _knownWordsHighlight
+                                  ? _vocabularyStore.isKnownSurface
+                                  : null,
+                              knownColor: _knownWordsHighlight
+                                  ? context.ll.textTertiary.withValues(
+                                      alpha: 0.75,
+                                    )
+                                  : null,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+                  return Listener(
+                    behavior: HitTestBehavior.translucent,
+                    onPointerDown: (event) {
+                      // 仅在贴紧屏幕最左侧 (dx <= 44.0) 长按 1 秒呼出上下滑动栏
+                      if (event.localPosition.dx <= 44.0) {
+                        _leftPointerDownPos = event.localPosition;
+                        _leftLongPressTimer?.cancel();
+                        _leftLongPressTimer = Timer(
+                          const Duration(milliseconds: 1000),
+                          () {
+                            if (!mounted) return;
+                            _startScrubbing(event.localPosition.dy);
+                          },
+                        );
+                      }
+                    },
+                    onPointerMove: (event) {
+                      if (_scrubbing) {
+                        _updateScrubbing(event.localPosition.dy);
+                      } else if (_leftPointerDownPos != null) {
+                        final delta = (event.localPosition - _leftPointerDownPos!).distance;
+                        if (delta > 20) {
+                          _leftLongPressTimer?.cancel();
+                          _leftPointerDownPos = null;
+                        }
+                      }
+                    },
+                    onPointerUp: (event) {
+                      _leftLongPressTimer?.cancel();
+                      _leftPointerDownPos = null;
+                      if (_scrubbing) {
+                        _endScrubbing();
+                      }
+                    },
+                    onPointerCancel: (event) {
+                      _leftLongPressTimer?.cancel();
+                      _leftPointerDownPos = null;
+                      if (_scrubbing) {
+                        _endScrubbing();
+                      }
+                    },
+                    child: Stack(
+                      children: [
+                        Positioned.fill(child: content),
+                        // 左侧上下滑动栏（长按左侧 1 秒呼出，支持上下拖动快速定位）
+                        if (_scrubberVisible || _scrubbing)
+                          Positioned(
+                            left: 0,
+                            top: 0,
+                            bottom: 0,
+                            child: _SentenceScrubber(
+                              sentenceCount: _controller.sentenceCount,
+                              currentIndex: _controller.currentSentenceIndex,
+                              scrubIndex: _scrubbing
+                                  ? _scrubIndex
+                                  : _controller.currentSentenceIndex,
+                              active: _scrubbing,
+                              height: constraints.maxHeight,
+                              previewSentence: _scrubbing
+                                  ? _controller.sentences[_scrubIndex]
+                                  : null,
+                              onDragStart: _startScrubbing,
+                              onDragUpdate: _updateScrubbing,
+                              onDragEnd: _endScrubbing,
+                            ),
+                          ),
+                      ],
+                    ),
+                  );
+                },
+              ),
+      ),
+    );
+
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: llSystemOverlay(ll.brightness),
+      child: Scaffold(
+        backgroundColor: ll.bg,
+        body: SafeArea(
+          // Horizontal swipe anywhere switches sentences: left→right =
+          // previous, right→left = next (user request 2026-09-16).
+          child: GestureDetector(
+            behavior: HitTestBehavior.translucent,
+            onHorizontalDragEnd: (details) {
+              final velocity = details.primaryVelocity ?? 0;
+              if (velocity < -200) {
+                if (_controller.canGoNext) _controller.nextSentence();
+              } else if (velocity > 200) {
+                if (_controller.canGoPrevious) {
+                  _controller.previousSentence();
+                }
+              }
+            },
+            child: Column(
+              children: [
+                // V2 follow-up: no title up top — the counter and the
+                // presentation toggle sit centred, quiet.
+                ListeningTopBar(
+                  displayIndex: controller.displayIndex,
+                  sentenceCount: controller.sentenceCount,
+                  leading: IconButton(
+                    key: const Key('ai-tutor-button'),
+                    tooltip: 'AI 伴学 / 快测 / Anki',
+                    icon: const Icon(
+                      Icons.auto_awesome_outlined,
+                      size: 18,
+                    ),
+                    color: ll.textSecondary,
+                    onPressed: _openAiTutor,
+                  ),
+                  // 右侧现有三个图标（听写 + more + 显示模式），左右槽位成对
+                  // 加宽且图标紧凑化（3×48 正好顶满 144 —— 不紧凑化则字体
+                  // 缩放下挤压中栏计数器，曾致「总句数」换行被裁）。
+                  slotWidth: 144,
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // 核心层 P1：听写入口。刻意放在一级页顶栏 —— 听写属于
+                      // 「听」的主链路，不允许埋进二级或附属面板。
+                      IconButton(
+                        key: const Key('dictation-button'),
+                        tooltip: LLStrings.of(context).dictation,
+                        icon: const Icon(Icons.keyboard_alt_outlined, size: 19),
+                        color: ll.textSecondary,
+                        visualDensity: VisualDensity.compact,
+                        onPressed: _openDictation,
+                      ),
+                      // 二级菜单：三级开关（生词积累）都收在这里，
+                      // 不与核心操作抢顶栏位置。
+                      IconButton(
+                        key: const Key('more-button'),
+                        tooltip: LLStrings.of(context).more,
+                        icon: const Icon(Icons.more_horiz_rounded, size: 20),
+                        color: ll.textSecondary,
+                        visualDensity: VisualDensity.compact,
+                        onPressed: _openMoreMenu,
+                      ),
+                      IconButton(
+                        key: const Key('view-mode-button'),
+                        tooltip: _pageMode
+                            ? LLStrings.of(context).fluidText
+                            : LLStrings.of(context).singlePageText,
+                        icon: Icon(
+                          _pageMode ? Icons.subject : Icons.view_day_outlined,
+                          size: 20,
+                          color: ll.textSecondary,
+                        ),
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => setState(() {
+                      if (_pageMode) {
+                        // 从单页切回流体时，精准定位到单页中用户浏览的句子
+                        if (_transcriptVisibleIndex >= 0 &&
+                            _transcriptVisibleIndex <
+                                _controller.sentenceCount &&
+                            _transcriptVisibleIndex !=
+                                _controller.currentSentenceIndex) {
+                          _controller.selectSentence(_transcriptVisibleIndex);
+                        }
+                      }
+                      _pageMode = !_pageMode;
+                      // 切换后立即请求定位到当前句（2026-09-22 用户反馈：
+                      // 模式切回后字幕定位失效，需手动找）。
+                      _revealToken++;
+                    }),
+                  ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  // Follow-up: video mode gets a taller stage; audio keeps a
+                  // calm, smaller mark.
+                  flex: controller.playbackMode == PlaybackMode.video ? 30 : 22,
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(16),
+                      // §三十五: the media slot crossfades when the source
+                      // changes — the content changed, not the page.
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 250),
+                        child: KeyedSubtree(
+                          key: ValueKey(controller.playbackMode),
+                          child: _renderMediaSlot(context, controller, loading),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+                // AUDIO|VIDEO typography switch — only for lessons with a
+                // video source (spec V2 §二十).
+                if (controller.hasVideoSource)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                    child: _modeToggle(context, controller),
+                  ),
+                Expanded(
+                  flex: 44,
+                  child: sentenceChild,
+                ),
+                if (controller.isInGap && controller.currentGapMs >= 8000)
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 300),
+                    curve: Curves.easeOutCubic,
+                    margin: const EdgeInsets.only(bottom: 6),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: ll.surface.withValues(alpha: 0.92),
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(
+                        color: ll.divider.withValues(alpha: 0.6),
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.08),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.music_note_rounded,
+                          size: 16,
+                          color: ll.textPrimary,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          controller.currentGapMs >= 10000
+                              ? '♪ 电影原声配乐播放中'
+                              : '· · · 剧情留白',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                            color: ll.textSecondary,
+                          ),
+                        ),
+                        if (controller.currentGapMs >= 5000) ...[
+                          const SizedBox(width: 10),
+                          GestureDetector(
+                            onTap: () => controller.skipGap(),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: ll.textPrimary.withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    '跳过配乐',
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: ll.textPrimary,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 2),
+                                  Icon(
+                                    Icons.fast_forward_rounded,
+                                    size: 13,
+                                    color: ll.textPrimary,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                // Follow-up: the whole control stack is compressed —
+                // tighter paddings and gaps so the sentence keeps the air.
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (controller.hasError) ...[
+                        _buildErrorBanner(context, controller.errorMessage!),
+                        const SizedBox(height: 6),
+                      ],
+                      PlaybackControls(
+                        isPlaying: controller.isPlaying,
+                        canGoPrevious: controller.canGoPrevious,
+                        canGoNext: controller.canGoNext,
+                        onPlayPause: _onPlayPause,
+                        onPrevious: controller.previousSentence,
+                        onNext: controller.nextSentence,
+                        enabled:
+                            controller.isInitialized && !controller.hasError,
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          _loopBadge(context, controller),
+                          Container(
+                            height: 10,
+                            width: 1,
+                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                            color: ll.divider,
+                          ),
+                          _gapBadge(context, controller),
+                          Container(
+                            height: 10,
+                            width: 1,
+                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                            color: ll.divider,
+                          ),
+                          _silenceModeBadge(context, controller),
+                          Container(
+                            height: 10,
+                            width: 1,
+                            margin: const EdgeInsets.symmetric(horizontal: 4),
+                            color: ll.divider,
+                          ),
+                          _ankiBadge(context, controller),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      GestureDetector(
+                        onLongPress: _showSpeedSheet,
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: SpeedSelector(
+                                playbackRate: controller.playbackRate,
+                                onChanged: controller.setSpeed,
+                                enabled:
+                                    controller.isInitialized &&
+                                    !controller.hasError,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      SubtitleModeSelector(
+                        mode: _subtitleMode,
+                        sourceLanguage: widget.language,
+                        onChanged: (mode) =>
+                            setState(() => _subtitleMode = mode),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// The transcript opens with the lesson's identity: title + one quiet
+  /// meta line (sentences · duration · source), then a hairline (spec V2
+  /// follow-up: 在字幕的开头加上视频标题与信息).
+  Widget _transcriptHeader(
+    BuildContext context,
+    SentencePlayerController controller,
+  ) {
+    final ll = context.ll;
+    final sentences = controller.sentences;
+    final durationMs = sentences.isEmpty ? 0 : sentences.last.endMs;
+    final meta = [
+      '${sentences.length} sentences',
+      _mmss(durationMs),
+      if (widget.videoSource != null)
+        '${widget.videoSource!.provider == VideoSource.providerYoutube ? 'YouTube' : 'Bilibili'} ${widget.videoSource!.bvid}',
+    ].join(' · ');
+    return Padding(
+      padding: const EdgeInsets.only(bottom: LLSpacing.lg),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            widget.title ?? 'ListenLoop',
+            style: LLText.pageTitle.copyWith(color: ll.textPrimary),
+          ),
+          const SizedBox(height: LLSpacing.xs),
+          Text(meta, style: LLText.caption.copyWith(color: ll.textTertiary)),
+          const SizedBox(height: LLSpacing.lg),
+          Divider(color: ll.divider),
+        ],
+      ),
+    );
+  }
+
+  String _mmss(int durationMs) {
+    final minutes = durationMs ~/ 60000;
+    final seconds = (durationMs % 60000) ~/ 1000;
+    return '${minutes.toString().padLeft(2, '0')}:'
+        '${seconds.toString().padLeft(2, '0')}';
+  }
+
+  /// The media slot: the embedded WebView while the controller is in video
+  /// mode, the lesson cover otherwise (Phase 3C §3). Which one is shown
+  /// follows `controller.playbackMode`, not the mere presence of a video
+  /// source — a lesson with a video still shows its cover in audio mode.
+  Widget _renderMediaSlot(
+    BuildContext context,
+    SentencePlayerController controller,
+    bool loading,
+  ) {
+    final showLoading = loading || controller.isSwitchingSource;
+    final videoFacade = _videoFacade;
+    if (controller.playbackMode == PlaybackMode.video &&
+        videoFacade is VideoPlaybackFacade) {
+      return VideoArea(
+        controller: videoFacade.controller,
+        loading: showLoading,
+      );
+    }
+    return MediaArea(coverPath: widget.coverPath, loading: showLoading);
+  }
+
+  /// AUDIO|VIDEO typography switch (spec V2 §二十): quiet text options,
+  /// the active one white with a short underline — no pill buttons.
+  Widget _modeToggle(
+    BuildContext context,
+    SentencePlayerController controller,
+  ) {
+    final ll = context.ll;
+    Widget option(PlaybackMode mode, String label, Key key) {
+      final selected = controller.playbackMode == mode;
+      return GestureDetector(
+        key: key,
+        behavior: HitTestBehavior.opaque,
+        onTap: () {
+          if (!selected) _controller.setPlaybackMode(mode);
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                width: 2,
+                color: selected ? ll.textPrimary : Colors.transparent,
+              ),
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+              letterSpacing: 1.5,
+              color: selected ? ll.textPrimary : ll.textTertiary,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      key: const Key('mode-toggle'),
+      children: [
+        option(PlaybackMode.audio, 'AUDIO', const Key('mode-option-audio')),
+        const SizedBox(width: 16),
+        option(PlaybackMode.video, 'VIDEO', const Key('mode-option-video')),
+      ],
+    );
+  }
+
+  /// Long-press the speed selector for continuous 0.5×–2.0× adjustment
+  /// (user request 2026-09-16). The three segmented rates stay for quick use.
+  Future<void> _showSpeedSheet() async {
+    final s = LLStrings.of(context);
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: context.ll.surface,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) {
+          final ll = sheetContext.ll;
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 16, 24, 24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    s.playbackSpeed,
+                    style: LLText.controlLabel.copyWith(color: ll.textPrimary),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    '${_controller.playbackRate.toStringAsFixed(2)}×',
+                    style: LLText.pageTitle.copyWith(color: ll.textPrimary),
+                  ),
+                  Slider(
+                    min: 0.5,
+                    max: 2.0,
+                    divisions: 30,
+                    label: '${_controller.playbackRate.toStringAsFixed(2)}×',
+                    value: _controller.playbackRate.clamp(0.5, 2.0),
+                    onChanged: (value) {
+                      setSheetState(() {});
+                      _controller.setSpeed(value);
+                    },
+                  ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        '0.5×',
+                        style: Theme.of(sheetContext).textTheme.labelSmall,
+                      ),
+                      Text(
+                        '2.0×',
+                        style: Theme.of(sheetContext).textTheme.labelSmall,
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _loopBadge(BuildContext context, SentencePlayerController controller) {
+    final ll = context.ll;
+    // §二十四 (V1): a quiet text label — `LOOP ×1` or just `∞` — never a
+    // big badge competing with the sentence.
+    final label = controller.repeatTarget == 0
+        ? '∞'
+        : 'LOOP ×${controller.repeatTarget}';
+    return InkWell(
+      key: const Key('loop-badge'),
+      onTap: () => _showLoopSheet(context),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 1.0,
+            color: ll.textSecondary,
+            fontFeatures: const [FontFeature.tabularFigures()],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 句间循环间隔 badge（v0.9.1 课堂需求）：显示当前间隔（如「+3s」），
+  /// 点按弹出 1/3/5 秒选择，**长按**进入滑动模式精调（0-10 秒）。
+  Widget _gapBadge(BuildContext context, SentencePlayerController controller) {
+    final ll = context.ll;
+    final s = controller.sentenceGapMs;
+    final label = s <= 0 ? '间隔' : '+${(s / 1000).toStringAsFixed(s % 1000 == 0 ? 0 : 1)}s';
+    return InkWell(
+      key: const Key('gap-badge'),
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => _showGapSheet(context),
+      onLongPress: () => _showGapSlider(context),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.5,
+            color: s > 0 ? ll.textPrimary : ll.textSecondary,
+            fontFeatures: const [FontFeature.tabularFigures()],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 句间间隔快选：1 / 3 / 5 秒或无间隔（课堂带读的常用节奏）。
+  Future<void> _showGapSheet(BuildContext context) async {
+    final current = _controller.sentenceGapMs;
+    final picked = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: context.ll.surface,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text('两句话之间的循环间隔', style: Theme.of(sheetContext).textTheme.labelLarge),
+            ),
+            for (final (value, label) in [
+              (0, '无间隔（连续播放）'),
+              (1000, '1 秒'),
+              (3000, '3 秒'),
+              (5000, '5 秒'),
+            ])
+              ListTile(
+                key: Key('gap-option-$value'),
+                title: Text(label),
+                trailing: value == current
+                    ? Icon(Icons.check, color: sheetContext.ll.textPrimary)
+                    : null,
+                onTap: () => Navigator.of(sheetContext).pop(value),
+              ),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12, left: 16, right: 16),
+              child: Text(
+                '长按「间隔」可进入滑动模式精调',
+                style: Theme.of(sheetContext).textTheme.labelSmall,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (picked != null) {
+      await _controller.setSentenceGap(picked);
+    }
+  }
+
+  /// 滑动模式精调（长按触发）：0-10 秒连续调整。
+  Future<void> _showGapSlider(BuildContext context) async {
+    var value = _controller.sentenceGapMs;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: context.ll.surface,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (sheetContext, setSheetState) => SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '句间间隔：${(value / 1000).toStringAsFixed(value % 1000 == 0 ? 0 : 1)} 秒',
+                  style: Theme.of(sheetContext).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 12),
+                Slider(
+                  key: const Key('gap-slider'),
+                  min: 0,
+                  max: 10000,
+                  divisions: 20,
+                  value: value.toDouble(),
+                  onChanged: (v) {
+                    setSheetState(() => value = v.round());
+                    _controller.setSentenceGap(v.round());
+                  },
+                ),
+                Text(
+                  '长按「间隔」外的任意点完成。当前设置立即生效。',
+                  style: Theme.of(sheetContext).textTheme.labelSmall,
+                ),
+                const SizedBox(height: 12),
+                FilledButton(
+                  onPressed: () => Navigator.of(sheetContext).pop(),
+                  child: const Text('完成'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _silenceModeBadge(
+    BuildContext context,
+    SentencePlayerController controller,
+  ) {
+    final ll = context.ll;
+    final isSkip = controller.skipSilence;
+    final label = isSkip ? '⚡ 跳过空白' : '🎬 原声连贯';
+    return InkWell(
+      key: const Key('silence-mode-badge'),
+      borderRadius: BorderRadius.circular(12),
+      onTap: () {
+        setState(() {
+          controller.toggleSkipSilence();
+        });
+        final newMode = controller.skipSilence;
+        ScaffoldMessenger.of(context).removeCurrentSnackBar();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              newMode
+                  ? '已开启：⚡ 紧凑精听（自动跳过中间空白）'
+                  : '已开启：🎬 原声连贯（电影原声自然播放，字幕稳定保持）',
+            ),
+            duration: const Duration(seconds: 2),
+            behavior: SnackBarBehavior.floating,
+          ),
+        );
+      },
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 11.5,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.5,
+            color: isSkip ? ll.textPrimary : ll.textSecondary,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _ankiBadge(
+    BuildContext context,
+    SentencePlayerController controller,
+  ) {
+    final ll = context.ll;
+    final lessonId = widget.lessonId ?? 'demo';
+    final isAdded = _aiGovernorService.isSentenceInAnki(
+      lessonId,
+      controller.currentSentenceIndex,
+    );
+
+    return InkWell(
+      key: const Key('anki-badge'),
+      borderRadius: BorderRadius.circular(12),
+      onTap: _toggleAnkiCard,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              isAdded ? Icons.style : Icons.style_outlined,
+              size: 12,
+              color: isAdded ? Colors.green : ll.textSecondary,
+            ),
+            const SizedBox(width: 3),
+            Text(
+              isAdded ? '已入闪卡' : '+ 闪卡',
+              style: TextStyle(
+                fontSize: 11.5,
+                fontWeight: FontWeight.w600,
+                color: isAdded ? Colors.green : ll.textSecondary,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Loop-count picker: 每句循环 1 / 3 / 5 / 10 次或无限次 (user request
+  /// 2026-09-16; default 1 — a sentence plays through once, then advances).
+  Future<void> _showLoopSheet(BuildContext context) async {
+    final s = LLStrings.of(context);
+    final target = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: context.ll.surface,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Text(s.loopsPerSentence),
+            ),
+            for (final (value, label) in [
+              (1, s.loopTimes(1)),
+              (3, s.loopTimes(3)),
+              (5, s.loopTimes(5)),
+              (10, s.loopTimes(10)),
+              (0, s.loopForever),
+            ])
+              ListTile(
+                key: Key('loop-option-$value'),
+                title: Text(label),
+                trailing: value == _controller.repeatTarget
+                    ? Icon(Icons.check, color: sheetContext.ll.textPrimary)
+                    : null,
+                onTap: () => Navigator.of(sheetContext).pop(value),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (target != null) {
+      await _controller.setRepeatTarget(target);
+    }
+  }
+
+  /// Non-blocking error strip (§三十八 spirit): monochrome — a failed video
+  /// or audio load never turns the whole screen red. The sentence stays
+  /// visible; the controls area shows what went wrong plus a retry action.
+  Widget _buildErrorBanner(BuildContext context, String message) {
+    final ll = context.ll;
+    return Material(
+      key: const Key('error-banner'),
+      color: ll.surfaceHigh,
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Row(
+          children: [
+            Icon(Icons.error_outline, size: 20, color: ll.textSecondary),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(message, style: TextStyle(color: ll.textPrimary)),
+            ),
+            TextButton(
+              key: const Key('error-retry-button'),
+              onPressed: _retry,
+              child: Text(
+                LLStrings.of(context).retry,
+                style: TextStyle(color: ll.textPrimary),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _retry() {
+    // Clear the sticky error first so playback methods are no longer gated
+    // (covers load failures, async errors and failed mode switches alike).
+    _controller.clearError();
+    if (_controller.isInitialized) {
+      _controller.playCurrentSentence();
+    } else {
+      _controller.initialize();
+    }
+  }
+}
+
+/// 左侧上下滑动栏（2026-09-22 优化）。
+///
+/// 平时隐藏不占视野；在流转文本模式下长按左侧 1 秒呼出，或者在单页模式下长按呼出。
+/// 拖动过程中滑块跟随手指比例移动，伴随触感反馈并弹出气泡预览目标句，
+/// 松手立即跳转到目标句，并在停留 3 秒后平滑淡出。
+class _SentenceScrubber extends StatelessWidget {
+  const _SentenceScrubber({
+    required this.sentenceCount,
+    required this.currentIndex,
+    required this.scrubIndex,
+    required this.active,
+    required this.height,
+    required this.previewSentence,
+    this.onDragStart,
+    this.onDragUpdate,
+    this.onDragEnd,
+  });
+
+  final int sentenceCount;
+  final int currentIndex;
+  final int scrubIndex;
+  final bool active;
+  final double height;
+  final Sentence? previewSentence;
+  final ValueChanged<double>? onDragStart;
+  final ValueChanged<double>? onDragUpdate;
+  final VoidCallback? onDragEnd;
+
+  @override
+  Widget build(BuildContext context) {
+    final ll = context.ll;
+    if (sentenceCount <= 1 || height <= 0) return const SizedBox.shrink();
+
+    final topOffset = height * 0.14;
+    final trackHeight = height * 0.72;
+
+    double fractionOf(int index) =>
+        (index / (sentenceCount - 1).clamp(1, 1 << 31)).clamp(0.0, 1.0);
+
+    return SizedBox(
+      width: active ? 280 : 44,
+      height: height,
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onVerticalDragStart: onDragStart != null
+            ? (d) => onDragStart!(d.localPosition.dy)
+            : null,
+        onVerticalDragUpdate: onDragUpdate != null
+            ? (d) => onDragUpdate!(d.localPosition.dy)
+            : null,
+        onVerticalDragEnd: onDragEnd != null ? (_) => onDragEnd!() : null,
+        child: Stack(
+          clipBehavior: Clip.none,
+          children: [
+            // 细长胶囊轨道：紧贴屏幕最左侧 (left: 4)
+            Positioned(
+              left: 4,
+              top: topOffset,
+              child: Container(
+                width: 3.5,
+                height: trackHeight,
+                decoration: BoxDecoration(
+                  color: ll.textPrimary.withValues(alpha: 0.18),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            // 当前播放句位置标记（短横刻度）
+            Positioned(
+              left: 0,
+              top: topOffset + trackHeight * fractionOf(currentIndex) - 1.5,
+              child: Container(
+                width: 11,
+                height: 3,
+                decoration: BoxDecoration(
+                  color: ll.textPrimary.withValues(alpha: 0.45),
+                  borderRadius: BorderRadius.circular(1.5),
+                ),
+              ),
+            ),
+            // 拖动 thumb：贴紧屏幕最左侧的胶囊滑块
+            Positioned(
+              left: 0,
+              top: topOffset +
+                  trackHeight * fractionOf(scrubIndex) -
+                  (active ? 13 : 10),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 120),
+                width: active ? 18 : 14,
+                height: active ? 26 : 20,
+                decoration: BoxDecoration(
+                  color: ll.textPrimary,
+                  borderRadius: const BorderRadius.only(
+                    topRight: Radius.circular(8),
+                    bottomRight: Radius.circular(8),
+                    topLeft: Radius.circular(2),
+                    bottomLeft: Radius.circular(2),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color:
+                          Colors.black.withValues(alpha: active ? 0.35 : 0.2),
+                      blurRadius: active ? 6 : 3,
+                      offset: const Offset(1, 1),
+                    ),
+                  ],
+                ),
+                child: Center(
+                  child: Icon(
+                    Icons.unfold_more_rounded,
+                    size: active ? 13 : 10,
+                    color: ll.bg,
+                  ),
+                ),
+              ),
+            ),
+            // 目标句预览气泡（向右展开）
+            if (active && previewSentence != null)
+              Positioned(
+                left: 26,
+                top: (topOffset +
+                        trackHeight * fractionOf(scrubIndex) -
+                        32)
+                    .clamp(12.0, (height - 90.0).clamp(12.0, height)),
+                child: Container(
+                  constraints: const BoxConstraints(maxWidth: 240),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                  decoration: BoxDecoration(
+                    color: ll.textPrimary.withValues(alpha: 0.95),
+                    borderRadius: BorderRadius.circular(12),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.3),
+                        blurRadius: 10,
+                        offset: const Offset(0, 4),
+                      ),
+                    ],
+                  ),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: ll.bg.withValues(alpha: 0.2),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                '${scrubIndex + 1} / $sentenceCount',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: ll.bg,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 5),
+                        Text(
+                          previewSentence!.originalText,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: ll.bg,
+                            height: 1.25,
+                          ),
+                        ),
+                        if (previewSentence!.translatedText.isNotEmpty) ...[
+                          const SizedBox(height: 3),
+                          Text(
+                            previewSentence!.translatedText,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              color: ll.bg.withValues(alpha: 0.85),
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+  }
