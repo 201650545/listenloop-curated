@@ -240,7 +240,7 @@ AI 返回的是 `skill state + reasonCodes + recommendedComponentIds`，**不是
 
 > ⚠️ **一个重要教训**：参考稿只能当**证据**，不能当**圣旨**。本次差异中 `just as obsessed`（课程包）vs `just obsessed`（参考稿）—— **课程包才是对的**，参考稿漏了一个 `as`。修正前必须逐条人工确认，不可脚本盲改。
 >
-> 校验工具：官方逐字稿 `D:/Work/gh-sync/_teded_official_transcript.txt` + difflib 词级对齐脚本。同法可用于质检**任何**新导入课程 —— 建议把「导入后转写质检」做成制课管线的固定关卡。
+> 校验工具：官方逐字稿 `D:/Work/AI精听训练器/05_GPT问诊台/_teded_official_transcript.txt` + difflib 词级对齐脚本。同法可用于质检**任何**新导入课程 —— 建议把「导入后转写质检」做成制课管线的固定关卡。
 
 ---
 
